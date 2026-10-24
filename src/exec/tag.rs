@@ -168,7 +168,14 @@ mod tests {
         assert_eq!(buf.lock().unwrap().as_slice(), b"a\nb");
     }
 
-    #[tokio::test]
+    // Multi-threaded + 2 worker threads is required for this test to mean
+    // anything: both spawned tasks' write_chunk/flush_partial calls are
+    // fully synchronous (the mutex lock and the write never yield), so on
+    // a current-thread runtime one task would simply run to completion
+    // before the other is ever polled and the two writers would never
+    // actually race at the scheduler level. With two real OS threads they
+    // genuinely contend on the shared mutex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_writers_never_interleave_within_a_line() {
         let (sink, buf) = shared_sink();
 
@@ -180,10 +187,11 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let mut w = TaggedWriter::new(Some(tag.to_string()), sink);
                 for i in 0..LINES {
-                    // Deliberately split the write across two chunks to
-                    // maximize the chance of an interleaving bug: the
-                    // line is only complete, and thus only eligible to be
-                    // written, once both chunks have landed.
+                    // Split each line across two write_chunk calls so a
+                    // line only becomes complete (and thus eligible to be
+                    // written) after both chunks have landed, widening
+                    // the window in which the other thread could interleave
+                    // if the shared-sink lock were not held correctly.
                     let first = format!("line-{i}-");
                     let second = "rest-of-payload-padding-to-make-the-write-nontrivial\n";
                     w.write_chunk(first.as_bytes()).await.unwrap();
