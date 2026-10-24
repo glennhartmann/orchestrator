@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package orchestrator.v1;
+
+message Graph {
+  repeated Node nodes = 1;
+  repeated Edge edges = 2;
+  Options options = 3;
+}
+
+message Node {
+  string name = 1;
+  repeated string command = 2;        // argv; command[0] is the program, or the whole line when shell = true
+  map<string, string> env = 3;
+  bool clear_env = 4;                 // start from an empty environment instead of inheriting
+  optional string working_dir = 5;
+  bool shell = 6;                     // run `sh -c "<command joined by space>"`
+  bool stdin_from_parent = 7;         // at most one node per graph
+}
+
+enum Stream {
+  STREAM_UNSPECIFIED = 0;
+  STREAM_STDOUT = 1;
+  STREAM_STDERR = 2;
+  STREAM_BOTH = 3;                    // stdout and stderr merged into one stream
+}
+
+message NodeStream { string node = 1; Stream stream = 2; }
+message FileSink { string path = 1; bool append = 2; }
+
+message DataEdge {
+  oneof source { NodeStream node = 1; string file = 2; }
+  oneof sink { string node_stdin = 3; FileSink file_sink = 4; }
+}
+
+message OrderEdge {
+  string after = 1;                   // upstream node that must exit first
+  string node = 2;                    // downstream node that waits
+  bool any_exit = 3;                  // false (default): upstream must exit 0
+}
+
+message Edge { oneof kind { DataEdge data = 1; OrderEdge order = 2; } }
+
+message Options {
+  optional uint64 queue_cap_bytes = 1;    // default 1048576
+  bool no_tags = 2;
+  optional uint64 shutdown_grace_ms = 3;  // default 5000
+}

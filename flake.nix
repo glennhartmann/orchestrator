@@ -14,6 +14,8 @@
           version = manifest.version;
           src = builtins.path { path = ./.; name = "orchestrator"; };
 
+          nativeBuildInputs = [ pkgs.protobuf ];
+
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
@@ -24,6 +26,7 @@
           packages = with pkgs; [
             clippy
             rustfmt
+            protobuf
           ];
         };
       in
