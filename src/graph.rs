@@ -95,6 +95,8 @@ pub enum ValidationError {
     Cycle(Vec<String>),
     #[error("node {0} has more than one inbound data edge to its stdin")]
     MultipleStdinEdges(String),
+    #[error("node {0} has stdin_from_parent set and an inbound data edge to its stdin")]
+    ConflictingStdinSources(String),
     #[error("node {0} has a STREAM_BOTH data edge alongside a STDOUT/STDERR data edge")]
     ConflictingSourceStreams(String),
     #[error("more than one node reads stdin from the parent: {}", .0.join(", "))]
@@ -264,9 +266,11 @@ impl Plan {
                 parent_stdin_names.clone(),
             ));
         }
+        let mut parent_ids: HashSet<NodeId> = HashSet::new();
         for name in &parent_stdin_names {
             if let Some(&id) = name_to_id.get(name.as_str()) {
                 node_specs[id.0].stdin = StdinSource::Parent;
+                parent_ids.insert(id);
             }
         }
 
@@ -401,11 +405,17 @@ impl Plan {
                 .push(se.source);
         }
         for (target, mut sources) in stdin_by_target {
+            let has_parent_stdin = parent_ids.contains(&target);
+            if has_parent_stdin {
+                errors.push(ValidationError::ConflictingStdinSources(
+                    node_specs[target.0].name.clone(),
+                ));
+            }
             if sources.len() > 1 {
                 errors.push(ValidationError::MultipleStdinEdges(
                     node_specs[target.0].name.clone(),
                 ));
-            } else {
+            } else if !has_parent_stdin {
                 node_specs[target.0].stdin = sources.pop().expect("non-empty by construction");
             }
         }

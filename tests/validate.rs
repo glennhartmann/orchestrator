@@ -202,6 +202,23 @@ fn rejects_two_nodes_reading_parent_stdin() {
 }
 
 #[test]
+fn rejects_parent_stdin_with_inbound_data_edge() {
+    // `b` reads stdin from the parent AND has an inbound data edge from
+    // `a`'s stdout: two sources for one stdin, which is exactly the
+    // ambiguity "at most one inbound data edge per node" forbids.
+    let g = graph(
+        vec![node("a", &["true"]), parent_stdin_node("b", &["cat"])],
+        vec![data_node_to_stdin("a", pb::Stream::Stdout, "b")],
+    );
+    let errs = Plan::from_proto(g).expect_err("conflicting stdin sources must be rejected");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ConflictingStdinSources(n) if n == "b")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
 fn rejects_empty_command() {
     let g = graph(vec![node("a", &[])], vec![]);
     let errs = Plan::from_proto(g).expect_err("empty command must be rejected");
