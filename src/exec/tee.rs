@@ -1,0 +1,586 @@
+//! Fan-out of one source stream to many sinks, with per-sink byte-bounded
+//! queues.
+//!
+//! The orchestrator's whole point is non-linear pipes: a node's stdout
+//! streams to several consumers at once, in real time, and no single slow
+//! or dead consumer may stall its siblings or the producer.
+
+use std::io;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::exec::sinks::Sink;
+
+/// Why a sink stopped consuming.
+#[derive(Debug)]
+pub enum SinkOutcome {
+    /// Saw end of stream and was finished cleanly.
+    Finished,
+    /// The consumer went away (`ErrorKind::BrokenPipe`) — normal pipeline
+    /// behavior, not a failure.
+    Closed,
+    /// Its [`CancellationToken`] fired, e.g. because the consuming node was
+    /// skipped.
+    Cancelled,
+    /// A write failed for some reason other than a closed consumer.
+    Errored(io::Error),
+}
+
+/// Fans a source stream out to a set of sinks.
+pub struct Tee {
+    cap_bytes: usize,
+    sinks: Vec<SinkHandle>,
+}
+
+struct SinkHandle {
+    name: String,
+    /// `None` once the sink has been removed from the live set; dropping
+    /// the sender is also what signals end of stream to a live sink task.
+    tx: Option<mpsc::UnboundedSender<Bytes>>,
+    sem: Arc<Semaphore>,
+    join: JoinHandle<SinkOutcome>,
+}
+
+/// Upper bound on a single read from the source. The read buffer is the
+/// smaller of this and the queue cap, which keeps per-sink in-flight bytes
+/// at no more than `cap_bytes` queued plus the one chunk being admitted.
+const MAX_CHUNK_BYTES: usize = 64 * 1024;
+
+impl Tee {
+    /// `cap_bytes` is the per-sink queue bound, in bytes (`Plan.queue_cap_bytes`).
+    pub fn new(cap_bytes: usize) -> Self {
+        Self {
+            // At least one byte, so a chunk is always admissible; at most
+            // `u32::MAX`, the widest amount `Semaphore` can be asked for in
+            // one acquire.
+            cap_bytes: cap_bytes.clamp(1, u32::MAX as usize),
+            sinks: Vec::new(),
+        }
+    }
+
+    /// Registers `sink` under `name` and starts its consumer task. The
+    /// returned token removes the sink from the live set when cancelled,
+    /// releasing any backpressure it was applying to the producer.
+    pub fn add_sink(&mut self, name: String, sink: Sink) -> CancellationToken {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sem = Arc::new(Semaphore::new(self.cap_bytes));
+        let token = CancellationToken::new();
+        let join = tokio::spawn(drain_sink(
+            sink,
+            rx,
+            sem.clone(),
+            token.clone(),
+            self.cap_bytes,
+        ));
+        self.sinks.push(SinkHandle {
+            name,
+            tx: Some(tx),
+            sem,
+            join,
+        });
+        token
+    }
+
+    /// Reads `src` to EOF or until every sink is gone, then drops `src`.
+    /// Returns true if it stopped early because no sinks remained.
+    pub async fn run(self, mut src: impl AsyncRead + Unpin) -> (bool, Vec<(String, SinkOutcome)>) {
+        let Tee {
+            cap_bytes,
+            mut sinks,
+        } = self;
+
+        // Indices into `sinks` of the sinks still worth writing to, in the
+        // order they were added. `sinks` itself is never reordered, so the
+        // reported outcomes stay in registration order.
+        let mut live: Vec<usize> = (0..sinks.len()).collect();
+        let mut buf = vec![0u8; cap_bytes.min(MAX_CHUNK_BYTES)];
+        let mut early_stop = live.is_empty();
+
+        while !early_stop {
+            let n = match src.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                // A failed read on the source is end of stream as far as
+                // the sinks are concerned; the scheduler learns about the
+                // producer's fate from its exit status, not from here.
+                Err(_) => break,
+            };
+            let chunk = Bytes::copy_from_slice(&buf[..n]);
+            // Clamped so a chunk larger than the whole cap can still be
+            // admitted instead of blocking forever.
+            let permits = n.min(cap_bytes) as u32;
+
+            for &i in &live {
+                let handle = &sinks[i];
+                let admitted = match handle.sem.acquire_many(permits).await {
+                    // The sink task gives these back once its write for
+                    // this chunk has returned.
+                    Ok(permit) => {
+                        permit.forget();
+                        handle
+                            .tx
+                            .as_ref()
+                            .is_some_and(|tx| tx.send(chunk.clone()).is_ok())
+                    }
+                    // Semaphore closed: the sink task has stopped, so it
+                    // will never drain. Never block on it again.
+                    Err(_) => false,
+                };
+                if !admitted {
+                    sinks[i].tx = None;
+                }
+            }
+            live.retain(|&i| sinks[i].tx.is_some());
+            early_stop = live.is_empty();
+        }
+
+        // Dropping every sender signals end of stream to the sinks that are
+        // still running; dropping `src` closes the orchestrator's read end,
+        // so a producer we stopped reading takes EPIPE/SIGPIPE rather than
+        // writing into a pipe nobody drains.
+        for handle in &mut sinks {
+            handle.tx = None;
+        }
+        drop(src);
+
+        let mut outcomes = Vec::with_capacity(sinks.len());
+        for handle in sinks {
+            let outcome = handle
+                .join
+                .await
+                .unwrap_or_else(|e| SinkOutcome::Errored(io::Error::other(e)));
+            outcomes.push((handle.name, outcome));
+        }
+        (early_stop, outcomes)
+    }
+}
+
+/// One sink's consumer task: writes queued chunks in order until end of
+/// stream, a write failure, or cancellation, then finishes the sink.
+async fn drain_sink(
+    mut sink: Sink,
+    mut rx: mpsc::UnboundedReceiver<Bytes>,
+    sem: Arc<Semaphore>,
+    token: CancellationToken,
+    cap_bytes: usize,
+) -> SinkOutcome {
+    let outcome = loop {
+        let chunk = tokio::select! {
+            biased;
+            () = token.cancelled() => break SinkOutcome::Cancelled,
+            chunk = rx.recv() => match chunk {
+                Some(chunk) => chunk,
+                None => break SinkOutcome::Finished,
+            },
+        };
+        let permits = chunk.len().min(cap_bytes) as u32;
+        // Cancellation has to be able to interrupt an in-flight write:
+        // a consumer that is stuck mid-write would otherwise go on
+        // throttling the producer for as long as the write takes.
+        let result = tokio::select! {
+            biased;
+            () = token.cancelled() => break SinkOutcome::Cancelled,
+            result = sink.write_all(&chunk) => result,
+        };
+        sem.add_permits(permits as usize);
+        if let Err(e) = result {
+            break if e.kind() == io::ErrorKind::BrokenPipe {
+                SinkOutcome::Closed
+            } else {
+                SinkOutcome::Errored(e)
+            };
+        }
+    };
+
+    // Whatever happened, this sink will never drain another byte: closing
+    // the semaphore fails the reader's pending and future acquires for it
+    // instead of leaving the reader blocked on a queue nobody serves.
+    sem.close();
+    sink.finish().await;
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncWriteExt, ReadBuf};
+
+    use crate::exec::sinks::{ScriptedWrite, TestSink};
+
+    const CAP: usize = 1 << 20;
+
+    /// A plain in-memory source whose handed-out byte count the test can
+    /// read, so "did `run` drain the source?" is an assertion rather than a
+    /// guess.
+    struct CountingSrc {
+        data: Bytes,
+        pos: usize,
+        handed_out: Arc<AtomicUsize>,
+    }
+
+    impl CountingSrc {
+        fn new(data: Vec<u8>) -> (Self, Arc<AtomicUsize>) {
+            let handed_out = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    data: Bytes::from(data),
+                    pos: 0,
+                    handed_out: handed_out.clone(),
+                },
+                handed_out,
+            )
+        }
+    }
+
+    impl AsyncRead for CountingSrc {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let n = buf.remaining().min(self.data.len() - self.pos);
+            let pos = self.pos;
+            let data = self.data.clone();
+            buf.put_slice(&data[pos..pos + n]);
+            self.pos += n;
+            self.handed_out.fetch_add(n, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Distinct, position-dependent bytes, so a reordering or a dropped
+    /// interior chunk cannot accidentally compare equal.
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn add_test_sink(tee: &mut Tee, name: &str, sink: TestSink) -> TestSinkProbe {
+        let received = sink.received_handle();
+        let finished = sink.finished_handle();
+        let token = tee.add_sink(name.to_string(), Sink::Test(sink));
+        TestSinkProbe {
+            received,
+            finished,
+            token,
+        }
+    }
+
+    struct TestSinkProbe {
+        received: Arc<Mutex<Vec<u8>>>,
+        finished: Arc<Mutex<bool>>,
+        token: CancellationToken,
+    }
+
+    impl TestSinkProbe {
+        fn bytes(&self) -> Vec<u8> {
+            self.received.lock().unwrap().clone()
+        }
+
+        fn len(&self) -> usize {
+            self.received.lock().unwrap().len()
+        }
+
+        fn is_finished(&self) -> bool {
+            *self.finished.lock().unwrap()
+        }
+    }
+
+    fn names(outcomes: &[(String, SinkOutcome)]) -> Vec<&str> {
+        outcomes.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn every_sink_gets_every_byte() {
+        let data = payload(200_000);
+        let mut tee = Tee::new(CAP);
+        let probes: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| add_test_sink(&mut tee, n, TestSink::new()))
+            .collect();
+
+        let (src, _) = CountingSrc::new(data.clone());
+        let (early_stop, outcomes) = tee.run(src).await;
+
+        assert!(
+            !early_stop,
+            "every sink survived, so this is not early stop"
+        );
+        assert_eq!(names(&outcomes), vec!["a", "b", "c"]);
+        for (name, outcome) in &outcomes {
+            assert!(
+                matches!(outcome, SinkOutcome::Finished),
+                "sink {name} should have finished cleanly, got {outcome:?}"
+            );
+        }
+        for (i, probe) in probes.iter().enumerate() {
+            assert_eq!(probe.bytes(), data, "sink {i} did not receive every byte");
+            assert!(probe.is_finished(), "sink {i} was never finished");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_sink_is_dropped_and_the_others_continue() {
+        let data = payload(200_000);
+        let mut tee = Tee::new(CAP);
+        let closing = add_test_sink(
+            &mut tee,
+            "closing",
+            TestSink::new().script(ScriptedWrite::Error(ErrorKind::BrokenPipe)),
+        );
+        let healthy = add_test_sink(&mut tee, "healthy", TestSink::new());
+
+        let (src, _) = CountingSrc::new(data.clone());
+        let (early_stop, outcomes) = tee.run(src).await;
+
+        assert!(!early_stop, "the healthy sink kept the tee reading");
+        assert_eq!(names(&outcomes), vec!["closing", "healthy"]);
+        assert!(
+            matches!(outcomes[0].1, SinkOutcome::Closed),
+            "BrokenPipe is a clean consumer close, got {:?}",
+            outcomes[0].1
+        );
+        assert!(matches!(outcomes[1].1, SinkOutcome::Finished));
+        assert_eq!(
+            healthy.bytes(),
+            data,
+            "a sibling closing must not cost the healthy sink any bytes"
+        );
+        assert_eq!(closing.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_error_that_is_not_broken_pipe_is_reported_as_errored() {
+        let data = payload(10_000);
+        let mut tee = Tee::new(CAP);
+        add_test_sink(
+            &mut tee,
+            "broken",
+            TestSink::new().script(ScriptedWrite::Error(ErrorKind::PermissionDenied)),
+        );
+        let healthy = add_test_sink(&mut tee, "healthy", TestSink::new());
+
+        let (src, _) = CountingSrc::new(data.clone());
+        let (_, outcomes) = tee.run(src).await;
+
+        match &outcomes[0].1 {
+            SinkOutcome::Errored(e) => assert_eq!(e.kind(), ErrorKind::PermissionDenied),
+            other => panic!("expected Errored, got {other:?}"),
+        }
+        assert!(matches!(outcomes[1].1, SinkOutcome::Finished));
+        assert_eq!(healthy.bytes(), data);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_sink_releases_its_backpressure() {
+        // A sink that never completes a write fills its 64-byte queue and
+        // then throttles the reader forever. Cancelling it must release the
+        // producer it was throttling — the deadlock the design calls out.
+        let data = payload(4096);
+        let mut tee = Tee::new(64);
+        let stuck = add_test_sink(
+            &mut tee,
+            "stuck",
+            TestSink::new().script(ScriptedWrite::Delay(Duration::from_secs(3600))),
+        );
+        let fast = add_test_sink(&mut tee, "fast", TestSink::new());
+
+        let (src, _) = CountingSrc::new(data.clone());
+        let run = tokio::spawn(tee.run(src));
+
+        // Wait until the fast sink stops making progress: that is the
+        // reader blocked trying to admit a chunk to the stuck sink.
+        let stalled_at = loop {
+            let before = fast.len();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if before > 0 && fast.len() == before {
+                break before;
+            }
+        };
+        assert!(
+            stalled_at < data.len(),
+            "the stuck sink should have throttled the reader well before EOF"
+        );
+
+        stuck.token.cancel();
+
+        let (early_stop, outcomes) = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("cancelling the stuck sink must release the reader")
+            .unwrap();
+
+        assert!(!early_stop);
+        assert_eq!(names(&outcomes), vec!["stuck", "fast"]);
+        assert!(
+            matches!(outcomes[0].1, SinkOutcome::Cancelled),
+            "got {:?}",
+            outcomes[0].1
+        );
+        assert!(matches!(outcomes[1].1, SinkOutcome::Finished));
+        assert_eq!(
+            fast.bytes(),
+            data,
+            "the surviving sink must still receive the whole stream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_sink_does_not_hold_back_a_fast_one() {
+        const CHUNKS: usize = 8;
+        const CHUNK_LEN: usize = 1024;
+
+        let mut tee = Tee::new(CAP);
+        let slow = add_test_sink(
+            &mut tee,
+            "slow",
+            TestSink::new().script(ScriptedWrite::Delay(Duration::from_secs(3600))),
+        );
+        let fast = add_test_sink(&mut tee, "fast", TestSink::new());
+
+        // A pipe, so the test controls chunk boundaries: each chunk is
+        // written only after the fast sink has received the previous one.
+        let (src, mut producer) = tokio::io::duplex(64 * 1024);
+        let run = tokio::spawn(tee.run(src));
+
+        for i in 0..CHUNKS {
+            producer.write_all(&vec![i as u8; CHUNK_LEN]).await.unwrap();
+            let want = (i + 1) * CHUNK_LEN;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while fast.len() < want {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "fast sink stalled at {} bytes waiting for chunk {i}: the slow \
+                     sink's first write serialized the whole tee",
+                    fast.len()
+                )
+            });
+        }
+
+        assert_eq!(
+            slow.len(),
+            0,
+            "the slow sink should still be inside its first write"
+        );
+        assert_eq!(fast.len(), CHUNKS * CHUNK_LEN);
+
+        slow.token.cancel();
+        drop(producer);
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run should finish once the source closes")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_reports_early_stop_when_the_last_sink_goes() {
+        let data = payload(1 << 20);
+        // A small cap so the reader has to wait on the queue after the
+        // first chunk, which is when it learns the sink is gone. (With a
+        // cap larger than the whole input, an in-memory source never makes
+        // the reader await at all and the question doesn't arise.)
+        let mut tee = Tee::new(4096);
+        add_test_sink(
+            &mut tee,
+            "only",
+            TestSink::new().script(ScriptedWrite::Error(ErrorKind::BrokenPipe)),
+        );
+
+        let (src, handed_out) = CountingSrc::new(data.clone());
+        let (early_stop, outcomes) = tee.run(src).await;
+
+        assert!(early_stop, "the last sink going away is an early stop");
+        assert!(matches!(outcomes[0].1, SinkOutcome::Closed));
+        let read = handed_out.load(Ordering::SeqCst);
+        assert!(
+            read < data.len() / 4,
+            "run must drop src rather than drain it to nowhere; it read {read} of {} bytes",
+            data.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tee_with_no_sinks_reads_nothing() {
+        let data = payload(1 << 20);
+        let (src, handed_out) = CountingSrc::new(data);
+
+        let (early_stop, outcomes) = Tee::new(CAP).run(src).await;
+
+        assert!(early_stop, "there is nowhere for the bytes to go");
+        assert!(outcomes.is_empty());
+        assert_eq!(handed_out.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_stays_bounded_and_no_bytes_are_lost() {
+        const CAP_BYTES: usize = 4096;
+        let data = payload(8 << 20);
+
+        let mut tee = Tee::new(CAP_BYTES);
+        let sink = add_test_sink(
+            &mut tee,
+            "slowish",
+            // Enough delayed writes to let the queue fill; the rest run at
+            // full speed so 8 MiB still moves in reasonable time.
+            (0..200).fold(TestSink::new(), |s, _| {
+                s.script(ScriptedWrite::Delay(Duration::from_millis(1)))
+            }),
+        );
+
+        let (src, handed_out) = CountingSrc::new(data.clone());
+        let run = tokio::spawn(tee.run(src));
+
+        // In-flight bytes = read from the source but not yet recorded by
+        // the sink. Unbounded queueing would let this reach 8 MiB.
+        let peak = Arc::new(AtomicUsize::new(0));
+        let sampler = {
+            let peak = peak.clone();
+            let handed_out = handed_out.clone();
+            let received = sink.received.clone();
+            tokio::spawn(async move {
+                loop {
+                    let in_flight = handed_out
+                        .load(Ordering::SeqCst)
+                        .saturating_sub(received.lock().unwrap().len());
+                    peak.fetch_max(in_flight, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_micros(200)).await;
+                }
+            })
+        };
+
+        let (early_stop, outcomes) = tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .expect("8 MiB through a bounded queue should not hang")
+            .unwrap();
+        sampler.abort();
+
+        assert!(!early_stop);
+        assert!(matches!(outcomes[0].1, SinkOutcome::Finished));
+        assert_eq!(
+            sink.bytes(),
+            data,
+            "every byte must arrive, in order, through the bounded queue"
+        );
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak > 0, "the sampler never observed any in-flight bytes");
+        assert!(
+            peak <= CAP_BYTES * 2,
+            "in-flight bytes peaked at {peak}, over the cap ({CAP_BYTES}) plus one chunk"
+        );
+    }
+}
