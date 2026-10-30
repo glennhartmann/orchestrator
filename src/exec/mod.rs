@@ -4,4 +4,4 @@ pub mod tag;
 pub mod tee;
 
 pub use tag::TaggedWriter;
-pub use tee::{SinkOutcome, Tee};
+pub use tee::{SinkOutcome, Tee, TeeOutcome};

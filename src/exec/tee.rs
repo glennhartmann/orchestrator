@@ -31,6 +31,20 @@ pub enum SinkOutcome {
     Errored(io::Error),
 }
 
+/// What one fan-out did.
+#[derive(Debug)]
+pub struct TeeOutcome {
+    /// True if the tee stopped because no sinks remained, rather than
+    /// because the source ended.
+    pub early_stop: bool,
+    /// `None` on a clean EOF. `Some` if reading the source failed: the
+    /// sinks received everything that did arrive and finished normally, but
+    /// the stream they saw was truncated.
+    pub read_error: Option<io::Error>,
+    /// Per-sink outcomes, in `add_sink` registration order.
+    pub sinks: Vec<(String, SinkOutcome)>,
+}
+
 /// Fans a source stream out to a set of sinks.
 pub struct Tee {
     cap_bytes: usize,
@@ -87,8 +101,7 @@ impl Tee {
     }
 
     /// Reads `src` to EOF or until every sink is gone, then drops `src`.
-    /// Returns true if it stopped early because no sinks remained.
-    pub async fn run(self, mut src: impl AsyncRead + Unpin) -> (bool, Vec<(String, SinkOutcome)>) {
+    pub async fn run(self, mut src: impl AsyncRead + Unpin) -> TeeOutcome {
         let Tee {
             cap_bytes,
             mut sinks,
@@ -100,15 +113,20 @@ impl Tee {
         let mut live: Vec<usize> = (0..sinks.len()).collect();
         let mut buf = vec![0u8; cap_bytes.min(MAX_CHUNK_BYTES)];
         let mut early_stop = live.is_empty();
+        let mut read_error = None;
 
         while !early_stop {
             let n = match src.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
-                // A failed read on the source is end of stream as far as
-                // the sinks are concerned; the scheduler learns about the
-                // producer's fate from its exit status, not from here.
-                Err(_) => break,
+                // The sinks still get everything that did arrive and
+                // finish normally, but a truncated stream must never be
+                // indistinguishable from a clean EOF: report it so the run
+                // summary can say the fan-out was cut short.
+                Err(e) => {
+                    read_error = Some(e);
+                    break;
+                }
             };
             let chunk = Bytes::copy_from_slice(&buf[..n]);
             // Clamped so a chunk larger than the whole cap can still be
@@ -148,15 +166,19 @@ impl Tee {
         }
         drop(src);
 
-        let mut outcomes = Vec::with_capacity(sinks.len());
+        let mut sink_outcomes = Vec::with_capacity(sinks.len());
         for handle in sinks {
             let outcome = handle
                 .join
                 .await
                 .unwrap_or_else(|e| SinkOutcome::Errored(io::Error::other(e)));
-            outcomes.push((handle.name, outcome));
+            sink_outcomes.push((handle.name, outcome));
         }
-        (early_stop, outcomes)
+        TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: sink_outcomes,
+        }
     }
 }
 
@@ -182,6 +204,10 @@ async fn drain_sink(
         // Cancellation has to be able to interrupt an in-flight write:
         // a consumer that is stuck mid-write would otherwise go on
         // throttling the producer for as long as the write takes.
+        // Abandoning the write can leave this sink with a partial final
+        // chunk, which is intended, not a bug: a cancelled sink belongs to
+        // a node that was skipped and will never read its stdin, so no one
+        // can observe the truncation.
         let result = tokio::select! {
             biased;
             () = token.cancelled() => break SinkOutcome::Cancelled,
@@ -223,20 +249,32 @@ mod tests {
 
     /// A plain in-memory source whose handed-out byte count the test can
     /// read, so "did `run` drain the source?" is an assertion rather than a
-    /// guess.
+    /// guess. Optionally fails instead of reaching EOF, to stand in for a
+    /// pipe whose read errors part-way through.
     struct CountingSrc {
         data: Bytes,
         pos: usize,
+        fail_at: Option<usize>,
         handed_out: Arc<AtomicUsize>,
     }
 
     impl CountingSrc {
         fn new(data: Vec<u8>) -> (Self, Arc<AtomicUsize>) {
+            Self::build(data, None)
+        }
+
+        /// Hands out `fail_at` bytes, then fails every subsequent read.
+        fn failing_at(data: Vec<u8>, fail_at: usize) -> (Self, Arc<AtomicUsize>) {
+            Self::build(data, Some(fail_at))
+        }
+
+        fn build(data: Vec<u8>, fail_at: Option<usize>) -> (Self, Arc<AtomicUsize>) {
             let handed_out = Arc::new(AtomicUsize::new(0));
             (
                 Self {
                     data: Bytes::from(data),
                     pos: 0,
+                    fail_at,
                     handed_out: handed_out.clone(),
                 },
                 handed_out,
@@ -250,7 +288,14 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            let n = buf.remaining().min(self.data.len() - self.pos);
+            let limit = self.fail_at.unwrap_or(self.data.len());
+            if self.pos >= limit {
+                if self.fail_at.is_some() {
+                    return Poll::Ready(Err(io::Error::new(ErrorKind::ConnectionReset, "boom")));
+                }
+                return Poll::Ready(Ok(()));
+            }
+            let n = buf.remaining().min(limit - self.pos);
             let pos = self.pos;
             let data = self.data.clone();
             buf.put_slice(&data[pos..pos + n]);
@@ -311,12 +356,17 @@ mod tests {
             .collect();
 
         let (src, _) = CountingSrc::new(data.clone());
-        let (early_stop, outcomes) = tee.run(src).await;
+        let TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: outcomes,
+        } = tee.run(src).await;
 
         assert!(
             !early_stop,
             "every sink survived, so this is not early stop"
         );
+        assert!(read_error.is_none(), "the source ended cleanly");
         assert_eq!(names(&outcomes), vec!["a", "b", "c"]);
         for (name, outcome) in &outcomes {
             assert!(
@@ -342,9 +392,14 @@ mod tests {
         let healthy = add_test_sink(&mut tee, "healthy", TestSink::new());
 
         let (src, _) = CountingSrc::new(data.clone());
-        let (early_stop, outcomes) = tee.run(src).await;
+        let TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: outcomes,
+        } = tee.run(src).await;
 
         assert!(!early_stop, "the healthy sink kept the tee reading");
+        assert!(read_error.is_none());
         assert_eq!(names(&outcomes), vec!["closing", "healthy"]);
         assert!(
             matches!(outcomes[0].1, SinkOutcome::Closed),
@@ -372,7 +427,7 @@ mod tests {
         let healthy = add_test_sink(&mut tee, "healthy", TestSink::new());
 
         let (src, _) = CountingSrc::new(data.clone());
-        let (_, outcomes) = tee.run(src).await;
+        let outcomes = tee.run(src).await.sinks;
 
         match &outcomes[0].1 {
             SinkOutcome::Errored(e) => assert_eq!(e.kind(), ErrorKind::PermissionDenied),
@@ -415,12 +470,17 @@ mod tests {
 
         stuck.token.cancel();
 
-        let (early_stop, outcomes) = tokio::time::timeout(Duration::from_secs(10), run)
+        let TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: outcomes,
+        } = tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("cancelling the stuck sink must release the reader")
             .unwrap();
 
         assert!(!early_stop);
+        assert!(read_error.is_none());
         assert_eq!(names(&outcomes), vec!["stuck", "fast"]);
         assert!(
             matches!(outcomes[0].1, SinkOutcome::Cancelled),
@@ -501,9 +561,14 @@ mod tests {
         );
 
         let (src, handed_out) = CountingSrc::new(data.clone());
-        let (early_stop, outcomes) = tee.run(src).await;
+        let TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: outcomes,
+        } = tee.run(src).await;
 
         assert!(early_stop, "the last sink going away is an early stop");
+        assert!(read_error.is_none());
         assert!(matches!(outcomes[0].1, SinkOutcome::Closed));
         let read = handed_out.load(Ordering::SeqCst);
         assert!(
@@ -514,13 +579,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failing_source_read_is_reported_not_mistaken_for_eof() {
+        let data = payload(200_000);
+        const ARRIVED: usize = 50_000;
+
+        let mut tee = Tee::new(CAP);
+        let probe = add_test_sink(&mut tee, "a", TestSink::new());
+
+        let (src, _) = CountingSrc::failing_at(data.clone(), ARRIVED);
+        let TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: outcomes,
+        } = tee.run(src).await;
+
+        let err = read_error.expect("a truncated stream must not look like a clean EOF");
+        assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+        assert!(!early_stop, "the sink was still live; the source failed");
+        assert!(
+            matches!(outcomes[0].1, SinkOutcome::Finished),
+            "a live sink still finishes cleanly with what arrived, got {:?}",
+            outcomes[0].1
+        );
+        assert_eq!(
+            probe.bytes(),
+            data[..ARRIVED],
+            "the sink must receive exactly the bytes that did arrive"
+        );
+    }
+
+    #[tokio::test]
     async fn a_tee_with_no_sinks_reads_nothing() {
         let data = payload(1 << 20);
         let (src, handed_out) = CountingSrc::new(data);
 
-        let (early_stop, outcomes) = Tee::new(CAP).run(src).await;
+        let TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: outcomes,
+        } = Tee::new(CAP).run(src).await;
 
         assert!(early_stop, "there is nowhere for the bytes to go");
+        assert!(read_error.is_none());
         assert!(outcomes.is_empty());
         assert_eq!(handed_out.load(Ordering::SeqCst), 0);
     }
@@ -562,13 +662,18 @@ mod tests {
             })
         };
 
-        let (early_stop, outcomes) = tokio::time::timeout(Duration::from_secs(60), run)
+        let TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: outcomes,
+        } = tokio::time::timeout(Duration::from_secs(60), run)
             .await
             .expect("8 MiB through a bounded queue should not hang")
             .unwrap();
         sampler.abort();
 
         assert!(!early_stop);
+        assert!(read_error.is_none());
         assert!(matches!(outcomes[0].1, SinkOutcome::Finished));
         assert_eq!(
             sink.bytes(),
