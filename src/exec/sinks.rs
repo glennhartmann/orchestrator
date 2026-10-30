@@ -220,21 +220,23 @@ pub struct SinkCtx {
     pub child_stdins: HashMap<NodeId, ChildStdin>,
     pub stdout: Arc<Mutex<Box<dyn Write + Send>>>,
     pub stderr: Arc<Mutex<Box<dyn Write + Send>>>,
-    /// The tag `build_sink` applies to the next `Passthrough` sink it
-    /// builds. The scheduler sets this to the source node's name before
-    /// building that node's fanout sinks, or leaves it `None` when
-    /// `--no-tags` is in effect.
-    pub tag: Option<String>,
 }
 
 /// Builds the concrete [`Sink`] a [`SinkSpec`] describes.
+///
+/// `source_node` is the name of the node whose stream this sink is
+/// attached to; it is used only to tag a `Passthrough` sink's output and
+/// is ignored for the other variants. Passed explicitly (rather than
+/// living as mutable state on `ctx`) so there is no way for a caller to
+/// forget to update it between nodes and silently mistag one node's
+/// output with another's name.
 ///
 /// For `Passthrough`, `STREAM_BOTH` is written to the shared stdout
 /// handle: the merged stream is produced by dup2'ing the child's stderr
 /// onto its stdout fd (see `exec::child::spawn`), so all of its bytes
 /// physically arrive on the child's stdout pipe, making stdout the
 /// sensible orchestrator-side destination too.
-pub fn build_sink(spec: &SinkSpec, ctx: &mut SinkCtx) -> io::Result<Sink> {
+pub fn build_sink(spec: &SinkSpec, ctx: &mut SinkCtx, source_node: &str) -> io::Result<Sink> {
     match spec {
         SinkSpec::NodeStdin(id) => {
             let stdin = ctx.child_stdins.remove(id).ok_or_else(|| {
@@ -254,7 +256,7 @@ pub fn build_sink(spec: &SinkSpec, ctx: &mut SinkCtx) -> io::Result<Sink> {
                 }
             };
             Ok(Sink::Passthrough(PassthroughSink(TaggedWriter::new(
-                ctx.tag.clone(),
+                Some(source_node.to_string()),
                 out,
             ))))
         }
@@ -316,7 +318,6 @@ mod tests {
             child_stdins: HashMap::new(),
             stdout,
             stderr,
-            tag: None,
         }
     }
 
@@ -423,11 +424,10 @@ mod tests {
             child_stdins: HashMap::new(),
             stdout,
             stderr,
-            tag: Some("src".to_string()),
         };
 
         for stream in [pb::Stream::Stdout, pb::Stream::Both] {
-            let mut sink = build_sink(&SinkSpec::Passthrough(stream), &mut ctx).unwrap();
+            let mut sink = build_sink(&SinkSpec::Passthrough(stream), &mut ctx, "src").unwrap();
             sink.write_all(b"line\n").await.unwrap();
             sink.finish().await;
         }
@@ -451,10 +451,10 @@ mod tests {
             child_stdins: HashMap::new(),
             stdout,
             stderr,
-            tag: Some("src".to_string()),
         };
 
-        let mut sink = build_sink(&SinkSpec::Passthrough(pb::Stream::Stderr), &mut ctx).unwrap();
+        let mut sink =
+            build_sink(&SinkSpec::Passthrough(pb::Stream::Stderr), &mut ctx, "src").unwrap();
         sink.write_all(b"oops\n").await.unwrap();
         sink.finish().await;
 
@@ -465,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn build_sink_errors_when_node_stdin_handle_is_not_registered() {
         let mut ctx = empty_ctx();
-        let result = build_sink(&SinkSpec::NodeStdin(NodeId(0)), &mut ctx);
+        let result = build_sink(&SinkSpec::NodeStdin(NodeId(0)), &mut ctx, "n");
         assert!(
             result.is_err(),
             "a consumer that hasn't spawned yet has no stdin handle to hand out"
