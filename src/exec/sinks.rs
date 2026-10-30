@@ -95,7 +95,16 @@ pub enum ScriptedWrite {
     Delay(std::time::Duration),
     /// Fail immediately with the given `io::ErrorKind`, recording nothing.
     Error(io::ErrorKind),
+    /// Panic, standing in for a sink whose write unwinds — e.g. a
+    /// passthrough sink whose shared stdout mutex was poisoned by another
+    /// writer's panic. The panic message contains [`PANIC_MESSAGE`] so a
+    /// test can recognise (and silence) its own expected panic.
+    Panic,
 }
+
+/// The payload a [`ScriptedWrite::Panic`] panics with.
+#[cfg(test)]
+pub const PANIC_MESSAGE: &str = "scripted TestSink panic";
 
 /// A sink that never spawns a process or touches the filesystem, so
 /// Task 6's tee can script slow consumers, failing consumers (including a
@@ -157,6 +166,7 @@ impl TestSink {
             Some(ScriptedWrite::Error(kind)) => {
                 Err(io::Error::new(kind, "scripted TestSink failure"))
             }
+            Some(ScriptedWrite::Panic) => panic!("{PANIC_MESSAGE}"),
             None => {
                 self.received.lock().unwrap().extend_from_slice(chunk);
                 Ok(())

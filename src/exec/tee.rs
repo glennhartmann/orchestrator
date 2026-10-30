@@ -191,6 +191,12 @@ async fn drain_sink(
     token: CancellationToken,
     cap_bytes: usize,
 ) -> SinkOutcome {
+    // The close must also happen if a write panics and this task unwinds:
+    // a straight-line close after the loop would be skipped, leaving the
+    // reader blocked forever on a queue nobody will ever serve (the join
+    // error it would learn from is only observable after the read loop).
+    let close_on_drop = CloseOnDrop(sem.clone());
+
     let outcome = loop {
         let chunk = tokio::select! {
             biased;
@@ -223,12 +229,28 @@ async fn drain_sink(
         }
     };
 
-    // Whatever happened, this sink will never drain another byte: closing
-    // the semaphore fails the reader's pending and future acquires for it
-    // instead of leaving the reader blocked on a queue nobody serves.
-    sem.close();
+    // Release the reader before finishing: flushing or closing the
+    // underlying handle can take a while, and there is nothing left for it
+    // to wait for. Dropping the guard early still leaves exactly one close
+    // path, which also covers the panic above.
+    drop(close_on_drop);
     sink.finish().await;
     outcome
+}
+
+/// Closes a sink's semaphore when its consumer task ends, by any route —
+/// end of stream, write error, cancellation, or an unwinding panic.
+///
+/// Once the task is gone the sink will never drain another byte, so the
+/// reader must never block admitting a chunk to it: closing the semaphore
+/// fails its pending and future acquires, which is how the reader learns
+/// to drop the sink from the live set. This is the single close path.
+struct CloseOnDrop(Arc<Semaphore>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 #[cfg(test)]
@@ -243,7 +265,7 @@ mod tests {
 
     use tokio::io::{AsyncWriteExt, ReadBuf};
 
-    use crate::exec::sinks::{ScriptedWrite, TestSink};
+    use crate::exec::sinks::{PANIC_MESSAGE, ScriptedWrite, TestSink};
 
     const CAP: usize = 1 << 20;
 
@@ -339,6 +361,49 @@ mod tests {
 
         fn is_finished(&self) -> bool {
             *self.finished.lock().unwrap()
+        }
+    }
+
+    type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>;
+
+    /// Swallows the panic report for a deliberately panicking [`TestSink`]
+    /// (identified by its payload) so an expected panic does not litter the
+    /// test log, while any other panic is still reported through the hook
+    /// that was installed before. Restores that hook on drop.
+    struct SilenceExpectedPanic(Arc<PanicHook>);
+
+    impl SilenceExpectedPanic {
+        fn install() -> Self {
+            let previous: Arc<PanicHook> = Arc::new(std::panic::take_hook());
+            let delegate = previous.clone();
+            std::panic::set_hook(Box::new(move |info| {
+                let payload = info.payload();
+                let expected = payload
+                    .downcast_ref::<String>()
+                    .is_some_and(|s| s.contains(PANIC_MESSAGE))
+                    || payload
+                        .downcast_ref::<&str>()
+                        .is_some_and(|s| s.contains(PANIC_MESSAGE));
+                if !expected {
+                    delegate(info);
+                }
+            }));
+            Self(previous)
+        }
+    }
+
+    impl Drop for SilenceExpectedPanic {
+        fn drop(&mut self) {
+            // `set_hook` itself panics if called from a panicking thread,
+            // which would turn a failing assertion in the test into an
+            // abort that hides the assertion message. Leaving the filtering
+            // hook installed in that case is harmless: it still delegates
+            // every unexpected panic.
+            if std::thread::panicking() {
+                return;
+            }
+            let previous = self.0.clone();
+            std::panic::set_hook(Box::new(move |info| previous(info)));
         }
     }
 
@@ -492,6 +557,55 @@ mod tests {
             fast.bytes(),
             data,
             "the surviving sink must still receive the whole stream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_sink_with_a_full_queue_releases_the_reader() {
+        // A panicking write unwinds the sink task, so the close that frees
+        // the reader has to happen on the unwind path too — e.g. a
+        // passthrough sink whose shared stdout mutex was poisoned by
+        // another writer's panic. The first (delayed) write guarantees the
+        // 64-byte queue is full and the reader is waiting on it when the
+        // second write panics.
+        let data = payload(4096);
+        let mut tee = Tee::new(64);
+        add_test_sink(
+            &mut tee,
+            "panicky",
+            TestSink::new()
+                .script(ScriptedWrite::Delay(Duration::from_millis(50)))
+                .script(ScriptedWrite::Panic),
+        );
+        let healthy = add_test_sink(&mut tee, "healthy", TestSink::new());
+
+        let (src, _) = CountingSrc::new(data.clone());
+        let silence = SilenceExpectedPanic::install();
+        let TeeOutcome {
+            early_stop,
+            read_error,
+            sinks: outcomes,
+        } = tokio::time::timeout(Duration::from_secs(10), tokio::spawn(tee.run(src)))
+            .await
+            .expect("a panicking sink must not leave the reader blocked on its queue")
+            .unwrap();
+        drop(silence);
+
+        assert!(!early_stop, "the healthy sink kept the tee reading");
+        assert!(read_error.is_none());
+        assert_eq!(names(&outcomes), vec!["panicky", "healthy"]);
+        match &outcomes[0].1 {
+            SinkOutcome::Errored(e) => assert!(
+                e.to_string().contains("panic"),
+                "the panic should be reported, got {e}"
+            ),
+            other => panic!("expected Errored, got {other:?}"),
+        }
+        assert!(matches!(outcomes[1].1, SinkOutcome::Finished));
+        assert_eq!(
+            healthy.bytes(),
+            data,
+            "a sibling panicking must not cost the healthy sink any bytes"
         );
     }
 
