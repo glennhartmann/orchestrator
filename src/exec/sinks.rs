@@ -220,16 +220,22 @@ pub struct SinkCtx {
     pub child_stdins: HashMap<NodeId, ChildStdin>,
     pub stdout: Arc<Mutex<Box<dyn Write + Send>>>,
     pub stderr: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Whether passthrough output should be tagged with its source node's
+    /// name. Set once from `Plan.tags` when the context is constructed for
+    /// a run and never updated afterwards — unlike a per-call mutable
+    /// field, a run-wide constant has no "forget to update it between
+    /// nodes" hazard.
+    pub tags: bool,
 }
 
 /// Builds the concrete [`Sink`] a [`SinkSpec`] describes.
 ///
 /// `source_node` is the name of the node whose stream this sink is
-/// attached to; it is used only to tag a `Passthrough` sink's output and
-/// is ignored for the other variants. Passed explicitly (rather than
-/// living as mutable state on `ctx`) so there is no way for a caller to
-/// forget to update it between nodes and silently mistag one node's
-/// output with another's name.
+/// attached to; it is used only to tag a `Passthrough` sink's output (and
+/// only when `ctx.tags` is set) and is ignored for the other variants.
+/// Passed explicitly (rather than living as mutable state on `ctx`) so
+/// there is no way for a caller to forget to update it between nodes and
+/// silently mistag one node's output with another's name.
 ///
 /// For `Passthrough`, `STREAM_BOTH` is written to the shared stdout
 /// handle: the merged stream is produced by dup2'ing the child's stderr
@@ -255,9 +261,13 @@ pub fn build_sink(spec: &SinkSpec, ctx: &mut SinkCtx, source_node: &str) -> io::
                     ctx.stdout.clone()
                 }
             };
+            let tag = if ctx.tags {
+                Some(source_node.to_string())
+            } else {
+                None
+            };
             Ok(Sink::Passthrough(PassthroughSink(TaggedWriter::new(
-                Some(source_node.to_string()),
-                out,
+                tag, out,
             ))))
         }
     }
@@ -318,6 +328,7 @@ mod tests {
             child_stdins: HashMap::new(),
             stdout,
             stderr,
+            tags: true,
         }
     }
 
@@ -424,6 +435,7 @@ mod tests {
             child_stdins: HashMap::new(),
             stdout,
             stderr,
+            tags: true,
         };
 
         for stream in [pb::Stream::Stdout, pb::Stream::Both] {
@@ -451,6 +463,7 @@ mod tests {
             child_stdins: HashMap::new(),
             stdout,
             stderr,
+            tags: true,
         };
 
         let mut sink =
@@ -460,6 +473,29 @@ mod tests {
 
         assert_eq!(stderr_buf.lock().unwrap().as_slice(), b"[src] oops\n");
         assert_eq!(stdout_buf.lock().unwrap().as_slice(), b"");
+    }
+
+    #[tokio::test]
+    async fn build_sink_passthrough_with_tags_disabled_writes_raw_bytes_untagged() {
+        let (stdout, stdout_buf) = shared_writer();
+        let (stderr, _) = shared_writer();
+        let mut ctx = SinkCtx {
+            child_stdins: HashMap::new(),
+            stdout,
+            stderr,
+            tags: false,
+        };
+
+        let mut sink =
+            build_sink(&SinkSpec::Passthrough(pb::Stream::Stdout), &mut ctx, "src").unwrap();
+        sink.write_all(b"plain\n").await.unwrap();
+        sink.finish().await;
+
+        assert_eq!(
+            stdout_buf.lock().unwrap().as_slice(),
+            b"plain\n",
+            "tags: false must produce raw bytes with no \"[src] \" prefix"
+        );
     }
 
     #[tokio::test]
