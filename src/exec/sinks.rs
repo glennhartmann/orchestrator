@@ -13,26 +13,55 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
+use tokio::sync::oneshot;
 
 use crate::exec::tag::TaggedWriter;
 use crate::graph::{NodeId, SinkSpec};
 use crate::pb;
 
 /// Writes to a downstream node's stdin pipe.
+pub struct ChildStdinSink(pub(crate) ChildStdinState);
+
+/// A child-stdin sink's lifecycle.
 ///
-/// Holds an `Option` so [`Self`] (via [`Sink::finish`]) can explicitly take
-/// and drop the handle, closing the write end of the pipe so the consumer
-/// sees EOF, while still allowing `write_all` to report a clear error if it
-/// is ever called after that point.
-pub struct ChildStdinSink(pub(crate) Option<ChildStdin>);
+/// A sink is registered with its tee when the *producer* spawns, which can
+/// be long before the consuming node itself starts — a consumer held back
+/// by an order edge is the whole reason a queue fills up. Until that node
+/// spawns there is no stdin pipe to write to, so the sink starts out
+/// `Pending`: the first write waits for the handle, which is exactly the
+/// backpressure the producer should feel. Cancelling the sink (because the
+/// consumer was skipped) interrupts that wait, since the tee races every
+/// write against the cancellation token.
+pub(crate) enum ChildStdinState {
+    /// Waiting for the consuming node to spawn and hand over its stdin.
+    Pending(oneshot::Receiver<ChildStdin>),
+    Connected(ChildStdin),
+    /// Finished, or the consumer never spawned at all. Holds no handle, so
+    /// our end of the pipe is closed and the consumer sees EOF.
+    Done,
+}
 
 impl ChildStdinSink {
     async fn write_all(&mut self, chunk: &[u8]) -> io::Result<()> {
+        if let ChildStdinState::Pending(_) = &self.0
+            && let ChildStdinState::Pending(rx) =
+                std::mem::replace(&mut self.0, ChildStdinState::Done)
+        {
+            // A dropped sender means the consumer will never spawn (it was
+            // skipped, or it spawned without a stdin pipe). That is the
+            // same situation as a consumer that went away: a closed pipe.
+            self.0 = match rx.await {
+                Ok(stdin) => ChildStdinState::Connected(stdin),
+                Err(_) => ChildStdinState::Done,
+            };
+        }
+
         match &mut self.0 {
-            Some(stdin) => stdin.write_all(chunk).await,
-            None => Err(io::Error::new(
+            ChildStdinState::Connected(stdin) => stdin.write_all(chunk).await,
+            ChildStdinState::Pending(_) => unreachable!("resolved just above"),
+            ChildStdinState::Done => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "child stdin sink already finished",
+                "child stdin sink has no pipe to write to",
             )),
         }
     }
@@ -40,7 +69,7 @@ impl ChildStdinSink {
     fn finish(&mut self) {
         // Dropping the handle closes our end of the pipe, which is what
         // lets the consumer's read return EOF.
-        self.0.take();
+        self.0 = ChildStdinState::Done;
     }
 }
 
@@ -220,14 +249,13 @@ impl Sink {
     }
 }
 
-/// Context the scheduler maintains while building sinks: child stdin
-/// handles keyed by the `NodeId` that owns them (populated only once that
-/// node's process has actually spawned — until then `build_sink` for a
-/// `NodeStdin` sink errors, which is how a queue fills behind an order
-/// edge), and the two handles shared by every passthrough sink writing to
-/// the orchestrator's own stdout/stderr.
+/// Context the scheduler maintains while building sinks: one channel per
+/// node that takes its stdin from another node, over which that node hands
+/// its stdin pipe to the sink when it spawns (see [`ChildStdinState`]), and
+/// the two handles shared by every passthrough sink writing to the
+/// orchestrator's own stdout/stderr.
 pub struct SinkCtx {
-    pub child_stdins: HashMap<NodeId, ChildStdin>,
+    pub child_stdins: HashMap<NodeId, oneshot::Receiver<ChildStdin>>,
     pub stdout: Arc<Mutex<Box<dyn Write + Send>>>,
     pub stderr: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Whether passthrough output should be tagged with its source node's
@@ -256,12 +284,11 @@ pub fn build_sink(spec: &SinkSpec, ctx: &mut SinkCtx, source_node: &str) -> io::
     match spec {
         SinkSpec::NodeStdin(id) => {
             let stdin = ctx.child_stdins.remove(id).ok_or_else(|| {
-                io::Error::other(format!(
-                    "no child stdin handle registered for node {}",
-                    id.0
-                ))
+                io::Error::other(format!("no stdin channel registered for node {}", id.0))
             })?;
-            Ok(Sink::ChildStdin(ChildStdinSink(Some(stdin))))
+            Ok(Sink::ChildStdin(ChildStdinSink(ChildStdinState::Pending(
+                stdin,
+            ))))
         }
         SinkSpec::File { path, append } => Ok(Sink::File(FileByteSink::open(path, *append)?)),
         SinkSpec::Passthrough(stream) => {
@@ -376,7 +403,7 @@ mod tests {
         let mut spawned = spawn(&spec, Stdio::piped(), true, false, false).unwrap();
         let stdin = spawned.child.stdin.take().expect("stdin should be piped");
 
-        let mut sink = Sink::ChildStdin(ChildStdinSink(Some(stdin)));
+        let mut sink = Sink::ChildStdin(ChildStdinSink(ChildStdinState::Connected(stdin)));
         sink.write_all(b"hello\n").await.unwrap();
         sink.finish().await;
 
@@ -402,6 +429,61 @@ mod tests {
         assert_eq!(out, "hello\n");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_child_stdin_sink_waits_for_its_consumer_to_spawn() {
+        // The producer's tee registers this sink before the consuming node
+        // exists. The write must not fail and must not lose the bytes: it
+        // waits, which is what throttles the producer.
+        let (tx, rx) = oneshot::channel();
+        let mut sink = Sink::ChildStdin(ChildStdinSink(ChildStdinState::Pending(rx)));
+
+        let write = tokio::spawn(async move {
+            sink.write_all(b"queued\n").await.unwrap();
+            sink.finish().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !write.is_finished(),
+            "the write must block until the consumer hands over its stdin"
+        );
+
+        let spec = base_spec(vec!["cat"]);
+        let mut spawned = spawn(&spec, Stdio::piped(), true, false, false).unwrap();
+        tx.send(spawned.child.stdin.take().expect("stdin is piped"))
+            .expect("the sink is still waiting");
+
+        tokio::time::timeout(Duration::from_secs(5), write)
+            .await
+            .expect("handing over the stdin pipe must release the write")
+            .unwrap();
+
+        let mut out = String::new();
+        spawned
+            .child
+            .stdout
+            .take()
+            .expect("stdout is piped")
+            .read_to_string(&mut out)
+            .await
+            .unwrap();
+        assert_eq!(out, "queued\n", "the queued bytes must reach the consumer");
+        assert!(spawned.child.wait().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn a_pending_child_stdin_sink_whose_consumer_never_spawns_reports_a_closed_pipe() {
+        let (tx, rx) = oneshot::channel::<ChildStdin>();
+        let mut sink = Sink::ChildStdin(ChildStdinSink(ChildStdinState::Pending(rx)));
+        drop(tx);
+
+        let err = sink
+            .write_all(b"nowhere")
+            .await
+            .expect_err("a consumer that will never spawn is a closed pipe");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
     #[tokio::test]
     async fn child_stdin_sink_reports_broken_pipe_as_closed() {
         // `true` exits immediately without reading stdin, so by the time
@@ -412,7 +494,7 @@ mod tests {
         let status = spawned.child.wait().await.unwrap();
         assert!(status.success());
 
-        let mut sink = Sink::ChildStdin(ChildStdinSink(Some(stdin)));
+        let mut sink = Sink::ChildStdin(ChildStdinSink(ChildStdinState::Connected(stdin)));
         let err = sink
             .write_all(b"data")
             .await
@@ -509,12 +591,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_sink_errors_when_node_stdin_handle_is_not_registered() {
+    async fn build_sink_errors_when_no_stdin_channel_is_registered() {
         let mut ctx = empty_ctx();
         let result = build_sink(&SinkSpec::NodeStdin(NodeId(0)), &mut ctx, "n");
         assert!(
             result.is_err(),
-            "a consumer that hasn't spawned yet has no stdin handle to hand out"
+            "a node with no registered stdin channel cannot be fed; the \
+             scheduler must register one for every node whose stdin comes \
+             from another node"
         );
     }
 

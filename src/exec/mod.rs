@@ -1,4 +1,5 @@
 pub mod child;
+pub mod run;
 pub mod sinks;
 pub mod tag;
 pub mod tee;
