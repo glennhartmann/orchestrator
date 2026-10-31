@@ -97,8 +97,14 @@ impl FileByteSink {
         self.0.write_all(chunk).await
     }
 
-    async fn finish(&mut self) {
-        let _ = self.0.flush().await;
+    /// Flushes, and reports whether that worked.
+    ///
+    /// `tokio::fs::File` hands the actual write to a blocking task, so a
+    /// write that fails — ENOSPC on a full disk is the classic case — may
+    /// not surface until here. Discarding this error would throw away the
+    /// only evidence that the output never landed.
+    async fn finish(&mut self) -> io::Result<()> {
+        self.0.flush().await
     }
 }
 
@@ -112,8 +118,8 @@ impl PassthroughSink {
         self.0.write_chunk(chunk).await
     }
 
-    async fn finish(&mut self) {
-        let _ = self.0.flush_partial().await;
+    async fn finish(&mut self) -> io::Result<()> {
+        self.0.flush_partial().await
     }
 }
 
@@ -238,13 +244,23 @@ impl Sink {
     /// Signals that no more bytes are coming. Drops the child stdin handle
     /// (so the consumer sees EOF) and flushes any buffered partial line
     /// for a passthrough sink.
-    pub async fn finish(mut self) {
+    ///
+    /// Returns the error if closing the destination failed. For a file that
+    /// is where a failed write usually appears, so a caller that discards
+    /// this is quietly dropping output and calling it success.
+    pub async fn finish(mut self) -> io::Result<()> {
         match &mut self {
-            Sink::ChildStdin(s) => s.finish(),
+            Sink::ChildStdin(s) => {
+                s.finish();
+                Ok(())
+            }
             Sink::File(s) => s.finish().await,
             Sink::Passthrough(s) => s.finish().await,
             #[cfg(test)]
-            Sink::Test(s) => s.finish(),
+            Sink::Test(s) => {
+                s.finish();
+                Ok(())
+            }
         }
     }
 }
@@ -377,10 +393,37 @@ mod tests {
 
         let mut sink = Sink::File(FileByteSink::open(&path, false).unwrap());
         sink.write_all(b"new\n").await.unwrap();
-        sink.finish().await;
+        sink.finish().await.unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(contents, b"new\n");
+    }
+
+    // `/dev/full` accepts writes and fails them with ENOSPC, which is the
+    // only way to see a real deferred write failure without faking I/O. It
+    // is Linux-only; macOS has no equivalent.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn file_sink_reports_a_deferred_write_failure_when_it_closes() {
+        let mut sink = Sink::File(FileByteSink::open(Path::new("/dev/full"), false).unwrap());
+
+        // `tokio::fs::File` hands the write to a blocking task, so this call
+        // may well report success; the failure lands on the flush below.
+        // Whichever way round it happens, the error must not vanish.
+        let write = sink.write_all(b"x").await;
+        let finish = sink.finish().await;
+
+        let err = match (write, finish) {
+            (Err(e), _) | (Ok(()), Err(e)) => e,
+            (Ok(()), Ok(())) => {
+                panic!("a write to /dev/full cannot succeed; the error was swallowed")
+            }
+        };
+        assert_eq!(
+            err.raw_os_error(),
+            Some(nix::libc::ENOSPC),
+            "expected ENOSPC, got {err}"
+        );
     }
 
     #[tokio::test]
@@ -391,7 +434,7 @@ mod tests {
 
         let mut sink = Sink::File(FileByteSink::open(&path, true).unwrap());
         sink.write_all(b"appended\n").await.unwrap();
-        sink.finish().await;
+        sink.finish().await.unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(contents, b"existing\nappended\n");
@@ -405,7 +448,7 @@ mod tests {
 
         let mut sink = Sink::ChildStdin(ChildStdinSink(ChildStdinState::Connected(stdin)));
         sink.write_all(b"hello\n").await.unwrap();
-        sink.finish().await;
+        sink.finish().await.unwrap();
 
         // If finish() failed to drop the stdin handle, `cat` would never
         // see EOF and this read would hang forever; bound it so a
@@ -439,7 +482,7 @@ mod tests {
 
         let write = tokio::spawn(async move {
             sink.write_all(b"queued\n").await.unwrap();
-            sink.finish().await;
+            sink.finish().await.unwrap();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -515,7 +558,7 @@ mod tests {
             "a line with no trailing newline must not be written until flushed"
         );
 
-        sink.finish().await;
+        sink.finish().await.unwrap();
         assert_eq!(buf.lock().unwrap().as_slice(), b"[n] partial-no-newline\n");
     }
 
@@ -533,7 +576,7 @@ mod tests {
         for stream in [pb::Stream::Stdout, pb::Stream::Both] {
             let mut sink = build_sink(&SinkSpec::Passthrough(stream), &mut ctx, "src").unwrap();
             sink.write_all(b"line\n").await.unwrap();
-            sink.finish().await;
+            sink.finish().await.unwrap();
         }
 
         assert_eq!(
@@ -561,7 +604,7 @@ mod tests {
         let mut sink =
             build_sink(&SinkSpec::Passthrough(pb::Stream::Stderr), &mut ctx, "src").unwrap();
         sink.write_all(b"oops\n").await.unwrap();
-        sink.finish().await;
+        sink.finish().await.unwrap();
 
         assert_eq!(stderr_buf.lock().unwrap().as_slice(), b"[src] oops\n");
         assert_eq!(stdout_buf.lock().unwrap().as_slice(), b"");
@@ -581,7 +624,7 @@ mod tests {
         let mut sink =
             build_sink(&SinkSpec::Passthrough(pb::Stream::Stdout), &mut ctx, "src").unwrap();
         sink.write_all(b"plain\n").await.unwrap();
-        sink.finish().await;
+        sink.finish().await.unwrap();
 
         assert_eq!(
             stdout_buf.lock().unwrap().as_slice(),

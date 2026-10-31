@@ -261,8 +261,19 @@ async fn drain_sink(
     // to wait for. Dropping the guard early still leaves exactly one close
     // path, which also covers the panic above.
     drop(close_on_drop);
-    sink.finish().await;
-    outcome
+
+    // A sink that drained everything and then failed to close has still
+    // lost the output: for a file, a deferred write error only surfaces at
+    // flush, so this is where ENOSPC usually turns up. An outcome that is
+    // already decided keeps its own story — the first error is the useful
+    // one, and a cancelled sink's torn tail is expected, not a fault.
+    match (&outcome, sink.finish().await) {
+        (SinkOutcome::Finished, Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => {
+            SinkOutcome::Closed
+        }
+        (SinkOutcome::Finished, Err(e)) => SinkOutcome::Errored(e),
+        _ => outcome,
+    }
 }
 
 /// Closes a sink's semaphore when its consumer task ends, by any route —

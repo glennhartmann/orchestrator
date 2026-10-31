@@ -200,12 +200,11 @@ fn a_producer_whose_consumer_was_already_skipped_still_finishes() {
     assert_eq!(outcome_of(&out, "c"), "skipped (bad failed)");
     assert!(!dir.path().join("c.out").exists());
     // Nothing is left to read p's output, so the orchestrator closes the
-    // pipe and p dies of SIGPIPE: abandoned, not failed.
-    assert!(
-        outcome_of(&out, "p").starts_with("abandoned"),
-        "got {:?}",
-        outcome_of(&out, "p")
-    );
+    // pipe and p dies of SIGPIPE. That is reported as a failure, not as
+    // abandonment: c did not walk out, we released its queue on `bad`'s
+    // account. Erring this way keeps us from ever excusing a nonzero exit
+    // we caused — the run is already failing because c was skipped.
+    assert_eq!(outcome_of(&out, "p"), "failed (killed by signal 13)");
     assert_eq!(code(&out), 1);
 }
 
@@ -463,6 +462,87 @@ fn a_node_that_exits_nonzero_after_losing_its_last_consumer_is_abandoned() {
 }
 
 #[test]
+fn a_broken_orchestrator_stdout_does_not_excuse_a_failing_node() {
+    // Being piped into something that leaves early — `orchestrator run g |
+    // head -1` — is ordinary usage. The pass-through sink going away is the
+    // orchestrator's own plumbing, not the graph walking out, so it must
+    // not turn a node's failure into a successful run.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("a", "seq 1 200000; exit 1");
+
+    let out = run_graph_with_broken_stdout(dir.path(), &graph);
+
+    assert_eq!(outcome_of(&out, "a"), "failed (exit 1)");
+    assert_eq!(
+        code(&out),
+        1,
+        "a failing node is a failing run even when our own stdout is gone"
+    );
+}
+
+#[test]
+fn another_nodes_failure_cancelling_a_sink_does_not_excuse_this_node() {
+    // m fails, which skips c, which releases the sink c was being fed
+    // through — and that sink was n's only destination. n then exits nonzero
+    // under its own steam (it ignores SIGPIPE). n's audience did not walk
+    // out, we shut it on m's account, so n is a failure and its own
+    // dependent must be skipped. Timing cannot tell this case apart: the
+    // cancellation belongs to another node and lands before n exits.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("m", "sleep 1; exit 1")
+        + &sh("n", "trap \"\" PIPE; seq 1 200000; exit 5")
+        + &sh("c", "cat > {dir}/c.out")
+        + &sh("dep", "printf ran > {dir}/dep.out")
+        + &data("n", "c")
+        + &order("m", "c")
+        + &order("n", "dep")
+        + &queue_cap_bytes(1024);
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    assert_eq!(outcome_of(&out, "c"), "skipped (m failed)");
+    assert_eq!(
+        outcome_of(&out, "n"),
+        "failed (exit 5)",
+        "n lost its sink to our cancellation, which is no excuse for exiting 5"
+    );
+    assert_eq!(outcome_of(&out, "dep"), "skipped (n failed)");
+    assert!(!dir.path().join("dep.out").exists());
+    assert_eq!(code(&out), 1);
+}
+
+// `/dev/full` accepts an open and then fails every write with ENOSPC, which
+// is the only way to get a real mid-stream sink failure without faking I/O.
+// It is Linux-only; macOS has no equivalent.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_destination_that_fails_mid_stream_fails_the_run() {
+    // The node itself is faultless and exits 0, but its output went on the
+    // floor, so the run's results are wrong — the same grounds as truncated
+    // input.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("a", "printf x") + &data_to_file("a", "/dev/full");
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    let outcome = outcome_of(&out, "a");
+    assert!(
+        outcome.starts_with("exited 0 but its output to /dev/full failed:"),
+        "the lost destination must be named in the node's own outcome: {outcome}"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("note:") && err.contains("/dev/full"),
+        "and noted alongside it:\n{err}"
+    );
+    assert_eq!(
+        code(&out),
+        1,
+        "output thrown away makes the run wrong even though the node exited 0"
+    );
+}
+
+#[test]
 fn unredirected_output_is_tagged_on_the_right_stream() {
     let graph = sh("n", "echo o; echo e >&2");
 
@@ -500,6 +580,33 @@ fn summary_goes_to_stderr_and_stdout_stays_clean() {
     );
     assert!(stderr(&out).contains("run summary:"));
     assert_eq!(code(&out), 0);
+}
+
+#[test]
+fn a_consumer_that_fails_to_start_releases_the_producer_it_was_throttling() {
+    // The mirror image of a skip: the consumer will never read its stdin,
+    // so the queue filling for it must be released when its *own* spawn
+    // fails. Otherwise its sink waits forever for a stdin pipe that cannot
+    // arrive, holding the permits the fan-out needs, and the producer —
+    // throttled by a 1 KiB queue — never exits and the run never ends.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("p", "seq 1 200000")
+        + &argv("c", &["orchestrator-no-such-program-xyzzy"])
+        + &data("p", "c")
+        + &queue_cap_bytes(1024);
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    assert!(
+        outcome_of(&out, "c").starts_with("failed to start:"),
+        "got {:?}",
+        outcome_of(&out, "c")
+    );
+    // Nothing is left to read p's output, so the orchestrator closes the
+    // pipe and p dies of SIGPIPE. It is *not* abandoned: the sink went away
+    // because we released it, not because a consumer walked out.
+    assert_eq!(outcome_of(&out, "p"), "failed (killed by signal 13)");
+    assert_eq!(code(&out), 1);
 }
 
 #[test]

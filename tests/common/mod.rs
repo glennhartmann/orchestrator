@@ -49,6 +49,18 @@ pub fn spawn_graph_in(dir: &Path, toml: &str) -> Child {
         .expect("spawn the orchestrator binary")
 }
 
+/// Runs the graph with the orchestrator's own stdout closed from under it,
+/// as `orchestrator run g | head -1` does once `head` has left. The returned
+/// `Output` has an empty `stdout` for that reason — the interesting part is
+/// the status and the summary on stderr.
+pub fn run_graph_with_broken_stdout(dir: &Path, toml: &str) -> Output {
+    let mut child = spawn_graph_in(dir, toml);
+    // Dropping our read end is what makes the orchestrator's writes to its
+    // own stdout fail, exactly as a departed `head` would.
+    drop(child.stdout.take().expect("stdout is piped"));
+    wait_within(child, RUN_TIMEOUT)
+}
+
 /// Waits for a run that is supposed to finish, turning a hang into a test
 /// failure instead of a hung suite.
 ///
@@ -66,7 +78,9 @@ pub fn wait_within(mut child: Child, timeout: std::time::Duration) -> Output {
         })
     }
 
-    let out = drain(child.stdout.take().expect("stdout is piped"));
+    // `None` when the caller has deliberately closed the orchestrator's
+    // stdout already — see `run_graph_with_broken_stdout`.
+    let out = child.stdout.take().map(drain);
     let err = drain(child.stderr.take().expect("stderr is piped"));
 
     let start = std::time::Instant::now();
@@ -87,7 +101,7 @@ pub fn wait_within(mut child: Child, timeout: std::time::Duration) -> Output {
 
     let output = Output {
         status,
-        stdout: out.join().expect("drain stdout"),
+        stdout: out.map_or_else(Vec::new, |h| h.join().expect("drain stdout")),
         stderr: err.join().expect("drain stderr"),
     };
     assert!(

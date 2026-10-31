@@ -56,12 +56,48 @@ struct NodeState {
     decided: Option<Outcome>,
     /// The upstream node whose failure cut this node's stdin short.
     truncated_by: Option<String>,
-    /// One of this node's streams had already lost every sink when the node
-    /// exited, so a nonzero exit means it was abandoned rather than broken.
-    /// Read from the fan-out's eager signal at the moment of exit, which is
-    /// both what scheduling needs and the only reading that cannot be
-    /// contaminated by consequences of the exit itself.
+    /// One of this node's streams had lost its whole *graph* audience when
+    /// the node exited, so a nonzero exit means it was abandoned rather than
+    /// broken. See [`Audience`] for what does and does not count.
     abandoned: bool,
+    /// A destination that failed mid-stream, with the error — the node's
+    /// output went on the floor even though the node itself exited 0.
+    lost_output: Option<(String, String)>,
+}
+
+/// What became of one fan-out's set of destinations, as far as deciding
+/// whether its producer was *abandoned* goes.
+///
+/// "Its last consumer went away" is a statement about the graph. Three
+/// things are therefore not abandonment, however they empty the live set:
+///
+/// - a **pass-through or file** sink leaving. That is the orchestrator's own
+///   plumbing failing — a broken stdout because we were piped into `head`,
+///   a file sink hitting ENOSPC — and must never excuse a node's failure.
+///   Tracked as `graph_consumers_only`.
+/// - a sink **we cancelled** because some node failed. It did not walk out;
+///   we shut it. Tracked as `cancelled`, which covers the cross-node case
+///   too: the cancellation can belong to a different node's failure and
+///   arrive before this producer's own exit is processed, where timing alone
+///   cannot tell the two apart.
+/// - a sink that is simply still there when the producer exits, which is
+///   the ordinary case and is what `no_sinks_left` being clear means.
+struct Audience {
+    /// The fan-out's eager "no sinks left" flag (see `Tee::no_sinks_left`).
+    no_sinks_left: watch::Receiver<bool>,
+    /// Every destination of this fan-out is another node's stdin, so
+    /// emptying the live set really is the graph walking out.
+    graph_consumers_only: bool,
+    /// We cancelled one of this fan-out's sinks.
+    cancelled: bool,
+}
+
+impl Audience {
+    /// Whether this fan-out losing its sinks is grounds for calling its
+    /// producer abandoned.
+    fn walked_out(&self) -> bool {
+        self.graph_consumers_only && !self.cancelled && *self.no_sinks_left.borrow()
+    }
 }
 
 /// Why one node waits for another.
@@ -107,9 +143,13 @@ struct Runner<'p> {
     /// stdin. Cancelling one releases a producer that the node's unread
     /// queue was throttling.
     stdin_tokens: HashMap<NodeId, CancellationToken>,
-    /// Per node, one "this fan-out has no sinks left" flag per stream it
-    /// produces, so a node's exit can be classified the instant it happens.
-    lost_audience: Vec<Vec<watch::Receiver<bool>>>,
+    /// Per node, one [`Audience`] per stream it produces, so a node's exit
+    /// can be classified the instant it happens.
+    audiences: Vec<Vec<Audience>>,
+    /// Which fan-out feeds a given node's stdin, as `(producer, slot into
+    /// that producer's `audiences`)`. Lets cancelling a sink be recorded
+    /// against the fan-out that was feeding it.
+    stdin_sink_slot: HashMap<NodeId, (NodeId, usize)>,
     tees: Vec<TeeHandle>,
     notes: Vec<(String, String)>,
     exit_tx: mpsc::UnboundedSender<(NodeId, io::Result<ExitStatus>)>,
@@ -162,7 +202,8 @@ impl<'p> Runner<'p> {
             },
             stdin_senders,
             stdin_tokens: HashMap::new(),
-            lost_audience: (0..plan.nodes.len()).map(|_| Vec::new()).collect(),
+            audiences: (0..plan.nodes.len()).map(|_| Vec::new()).collect(),
+            stdin_sink_slot: HashMap::new(),
             tees: Vec::new(),
             notes: Vec::new(),
             exit_tx,
@@ -250,10 +291,7 @@ impl<'p> Runner<'p> {
         let mut tees = Vec::new();
         for fanout in self.plan.fanouts.iter().filter(|f| f.source == id) {
             match self.build_tee(fanout) {
-                Ok(tee) => {
-                    self.lost_audience[id.0].push(tee.no_sinks_left());
-                    tees.push((fanout.stream, tee));
-                }
+                Ok(tee) => tees.push((fanout.stream, tee)),
                 Err(e) => return self.spawn_failed(id, e),
             }
         }
@@ -297,6 +335,13 @@ impl<'p> Runner<'p> {
         self.nodes[id.0].decided = Some(Outcome::SpawnFailed {
             message: error.to_string(),
         });
+        // This node will never read its own stdin, so whatever is queued for
+        // it must be released on exactly the grounds a skip uses. Without
+        // this, a producer throttled by the queue of a consumer that failed
+        // to start is wedged forever: its sink waits for a stdin pipe that
+        // can never arrive, holding permits the tee needs, so the producer
+        // never exits and the run never ends.
+        self.release_stdin_sink(id);
         self.propagate_failure(id, id, false);
     }
 
@@ -349,6 +394,9 @@ impl<'p> Runner<'p> {
         let plan = self.plan;
         let source = plan.node(fanout.source).name.clone();
         let mut tee = Tee::new(plan.queue_cap_bytes);
+        let slot = self.audiences[fanout.source.0].len();
+        let mut graph_consumers_only = true;
+        let mut cancelled = false;
 
         for spec in &fanout.sinks {
             let label = sink_label(plan, spec);
@@ -365,17 +413,47 @@ impl<'p> Runner<'p> {
             // passthrough sink's bytes are output somebody wants; the
             // "nobody will read it anyway" argument holds for a skipped
             // node's stdin and nowhere else.
-            if let SinkSpec::NodeStdin(consumer) = spec {
-                if self.nodes[consumer.0].decided.is_some() {
-                    // Already skipped before its producer even started;
-                    // release the queue immediately rather than let it fill.
-                    token.cancel();
-                } else {
-                    self.stdin_tokens.insert(*consumer, token);
+            match spec {
+                SinkSpec::NodeStdin(consumer) => {
+                    self.stdin_sink_slot
+                        .insert(*consumer, (fanout.source, slot));
+                    if self.nodes[consumer.0].decided.is_some() {
+                        // Already skipped or failed to start before its
+                        // producer even began; release the queue now rather
+                        // than let it fill for nobody.
+                        token.cancel();
+                        cancelled = true;
+                    } else {
+                        self.stdin_tokens.insert(*consumer, token);
+                    }
                 }
+                SinkSpec::File { .. } | SinkSpec::Passthrough(_) => graph_consumers_only = false,
             }
         }
+
+        self.audiences[fanout.source.0].push(Audience {
+            no_sinks_left: tee.no_sinks_left(),
+            graph_consumers_only,
+            cancelled,
+        });
         Ok(tee)
+    }
+
+    /// Releases the sink feeding `consumer`'s stdin, because `consumer` will
+    /// never read it. Recorded against the fan-out that was feeding it: a
+    /// sink we shut did not walk out, so it can never make its producer look
+    /// abandoned.
+    fn release_stdin_sink(&mut self, consumer: NodeId) {
+        if let Some(token) = self.stdin_tokens.remove(&consumer) {
+            token.cancel();
+        }
+        // Dropping the sender closes the pipe for a sink that has not yet
+        // been connected, so a `Pending` sink waiting on this node's stdin
+        // stops waiting instead of pinning its producer forever.
+        self.stdin_senders.remove(&consumer);
+        if let Some((producer, slot)) = self.stdin_sink_slot.get(&consumer).copied() {
+            self.audiences[producer.0][slot].cancelled = true;
+        }
     }
 
     fn handle_exit(&mut self, id: NodeId, status: io::Result<ExitStatus>) {
@@ -389,13 +467,12 @@ impl<'p> Runner<'p> {
         };
 
         // Read *now*, before anything downstream of this exit happens: a
-        // fan-out that had already run out of sinks is what abandons a
-        // producer, whereas sinks cancelled in response to this very exit
-        // (just below) are a consequence of it and must not excuse it.
-        // Reading the flag at this instant distinguishes the two by timing
-        // alone, and it is the same reading the summary will use, so what
-        // the scheduler does and what the summary says can never disagree.
-        let abandoned = self.lost_audience[id.0].iter().any(|flag| *flag.borrow());
+        // fan-out whose graph consumers had already walked out is what
+        // abandons a producer, whereas sinks cancelled in response to this
+        // very exit (just below) are a consequence of it and must not excuse
+        // it. This is the same reading the summary will use, so what the
+        // scheduler does and what the summary says can never disagree.
+        let abandoned = self.audiences[id.0].iter().any(Audience::walked_out);
 
         let sched_ok = match observed {
             // Abandonment counts as success for scheduling: a producer
@@ -454,9 +531,7 @@ impl<'p> Runner<'p> {
                 because: because.clone(),
             });
 
-            if let Some(token) = self.stdin_tokens.remove(&dep.node) {
-                token.cancel();
-            }
+            self.release_stdin_sink(dep.node);
             self.propagate_failure(dep.node, root, false);
         }
     }
@@ -478,9 +553,7 @@ impl<'p> Runner<'p> {
             self.nodes[i].decided = Some(Outcome::Skipped {
                 because: "an upstream node".to_string(),
             });
-            if let Some(token) = self.stdin_tokens.remove(&NodeId(i)) {
-                token.cancel();
-            }
+            self.release_stdin_sink(NodeId(i));
         }
 
         // Every node has by now either started — handing its stdin pipe over
@@ -513,12 +586,29 @@ impl<'p> Runner<'p> {
                 }
             };
 
+            // Known gap: neither of these two conditions is covered by an
+            // end-to-end test. A mid-stream read failure on a child's own
+            // pipe cannot be induced from a graph fixture without faking
+            // I/O, and a sink write failure needs a destination that accepts
+            // an open and then refuses the write (`/dev/full`, which exists
+            // only on Linux and is used by one `cfg`-gated test). The
+            // formatting and placement of both are unit-tested in
+            // `report.rs`; the triggers are not.
             if let Some(e) = read_error {
                 self.note(&name, format!("reading {stream} was cut short: {e}"));
             }
             for (sink, outcome) in sinks {
                 if let SinkOutcome::Errored(e) = outcome {
                     self.note(&name, format!("writing {stream} to {sink} failed: {e}"));
+                    // A node that exited 0 into a destination that then
+                    // failed has had its results thrown away, which makes
+                    // the *run* wrong on the same grounds as truncated
+                    // input. First failure wins: one named destination is
+                    // enough to act on.
+                    let state = &mut self.nodes[node.0];
+                    if state.lost_output.is_none() {
+                        state.lost_output = Some((sink, e.to_string()));
+                    }
                 }
             }
         }
@@ -560,11 +650,19 @@ impl<'p> Runner<'p> {
         };
 
         if status.success() {
-            match &state.truncated_by {
-                Some(upstream) => Outcome::TruncatedInput {
+            // Both of these say "the node is blameless but the run's results
+            // are wrong". Truncated input comes first: an upstream failure
+            // is the root cause and names the node to go and look at, where
+            // a lost destination may well be a consequence of it.
+            match (&state.truncated_by, &state.lost_output) {
+                (Some(upstream), _) => Outcome::TruncatedInput {
                     upstream: upstream.clone(),
                 },
-                None => Outcome::Succeeded,
+                (None, Some((destination, error))) => Outcome::LostOutput {
+                    destination: destination.clone(),
+                    error: error.clone(),
+                },
+                (None, None) => Outcome::Succeeded,
             }
         } else if state.abandoned {
             Outcome::Abandoned

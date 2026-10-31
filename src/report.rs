@@ -14,6 +14,15 @@ pub enum Outcome {
     TruncatedInput {
         upstream: String,
     },
+    /// Exited 0, but one of its destinations failed mid-stream, so some of
+    /// the output it produced never arrived. Like [`Self::TruncatedInput`],
+    /// the node is not at fault and the run's results are still on the
+    /// floor. Only ever used for a node that exited 0: one that failed on
+    /// its own account keeps [`Self::Failed`].
+    LostOutput {
+        destination: String,
+        error: String,
+    },
     Failed {
         code: Option<i32>,
         signal: Option<i32>,
@@ -49,6 +58,9 @@ impl Outcome {
             Outcome::Abandoned => "abandoned (its last consumer went away)".to_string(),
             Outcome::TruncatedInput { upstream } => {
                 format!("exited 0 with truncated input ({upstream} failed mid-stream)")
+            }
+            Outcome::LostOutput { destination, error } => {
+                format!("exited 0 but its output to {destination} failed: {error}")
             }
             Outcome::Failed {
                 code: Some(code),
@@ -154,6 +166,10 @@ mod tests {
             Outcome::TruncatedInput {
                 upstream: "a".to_string(),
             },
+            Outcome::LostOutput {
+                destination: "/dev/full".to_string(),
+                error: "No space left on device".to_string(),
+            },
         ];
         for outcome in failures {
             let r = report(&[("a", Outcome::Succeeded), ("b", outcome.clone())]);
@@ -208,6 +224,23 @@ mod tests {
         assert!(
             text.contains("exit 3"),
             "a failure must report its exit status:\n{text}"
+        );
+    }
+
+    #[test]
+    fn summary_names_the_destination_that_lost_a_nodes_output() {
+        let r = report(&[(
+            "a",
+            Outcome::LostOutput {
+                destination: "/dev/full".to_string(),
+                error: "No space left on device (os error 28)".to_string(),
+            },
+        )]);
+        let text = summary(&r);
+
+        assert!(
+            text.contains("/dev/full") && text.contains("No space left on device"),
+            "a lost destination is only actionable if it is named, with its error:\n{text}"
         );
     }
 
