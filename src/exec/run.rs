@@ -469,6 +469,13 @@ impl<'p> Runner<'p> {
             }
         }
 
+        // Every node has by now either started — handing its stdin pipe over
+        // as it did — or been decided, so any sender still held here belongs
+        // to a node that will never spawn. Dropping them closes those pipes,
+        // which also means no fan-out below can wait on a handle that is
+        // never coming.
+        self.stdin_senders.clear();
+
         for TeeHandle {
             node,
             stream,
