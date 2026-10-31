@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +49,9 @@ pub struct TeeOutcome {
 pub struct Tee {
     cap_bytes: usize,
     sinks: Vec<SinkHandle>,
+    /// Published the moment the live set empties — see
+    /// [`Tee::no_sinks_left`].
+    no_sinks_left: watch::Sender<bool>,
 }
 
 struct SinkHandle {
@@ -74,7 +77,22 @@ impl Tee {
             // one acquire.
             cap_bytes: cap_bytes.clamp(1, u32::MAX as usize),
             sinks: Vec::new(),
+            no_sinks_left: watch::channel(false).0,
         }
+    }
+
+    /// Observes "this fan-out has no sinks left" *as it happens*, rather
+    /// than when [`Self::run`] eventually returns its [`TeeOutcome`].
+    ///
+    /// The distinction matters to the scheduler. Dropping the source is
+    /// what makes the producer take EPIPE/SIGPIPE and die, so by the time
+    /// that producer's exit is observed, the question "had it lost its
+    /// whole audience?" must already be answerable — but `run` does not
+    /// return until every sink task has been joined, which can be later.
+    /// The flag latches: it never goes back to false, and it stays readable
+    /// after the fan-out is over.
+    pub fn no_sinks_left(&self) -> watch::Receiver<bool> {
+        self.no_sinks_left.subscribe()
     }
 
     /// Registers `sink` under `name` and starts its consumer task. The
@@ -105,6 +123,7 @@ impl Tee {
         let Tee {
             cap_bytes,
             mut sinks,
+            no_sinks_left,
         } = self;
 
         // Indices into `sinks` of the sinks still worth writing to, in the
@@ -155,6 +174,14 @@ impl Tee {
             }
             live.retain(|&i| sinks[i].tx.is_some());
             early_stop = live.is_empty();
+        }
+
+        if early_stop {
+            // Published here, before `src` is dropped below: dropping it is
+            // what kills the producer, so anyone classifying that producer's
+            // exit must be able to see this first. (A tee that was handed no
+            // sinks at all also lands here, having never entered the loop.)
+            no_sinks_left.send_replace(true);
         }
 
         // Dropping every sender signals end of stream to the sinks that are
@@ -689,6 +716,63 @@ mod tests {
             read < data.len() / 4,
             "run must drop src rather than drain it to nowhere; it read {read} of {} bytes",
             data.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_no_sinks_left_signal_fires_when_the_last_sink_goes() {
+        let data = payload(1 << 20);
+        // A cap smaller than the input, so the reader has to come back for
+        // the queue and thus notices the sink is gone.
+        let mut tee = Tee::new(4096);
+        add_test_sink(
+            &mut tee,
+            "only",
+            TestSink::new().script(ScriptedWrite::Error(ErrorKind::BrokenPipe)),
+        );
+        let signal = tee.no_sinks_left();
+        assert!(
+            !*signal.borrow(),
+            "the sink is live; the fan-out has not lost its audience"
+        );
+
+        let (src, _) = CountingSrc::new(data);
+        let outcome = tee.run(src).await;
+
+        assert!(outcome.early_stop);
+        assert!(
+            *signal.borrow(),
+            "losing the last sink must be observable, not just reported afterwards"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_no_sinks_left_signal_stays_clear_when_the_source_simply_ends() {
+        let mut tee = Tee::new(CAP);
+        let probe = add_test_sink(&mut tee, "healthy", TestSink::new());
+        let signal = tee.no_sinks_left();
+
+        let (src, _) = CountingSrc::new(payload(10_000));
+        let outcome = tee.run(src).await;
+
+        assert!(!outcome.early_stop);
+        assert!(
+            !*signal.borrow(),
+            "a clean end of stream is not the fan-out losing its sinks"
+        );
+        assert_eq!(probe.len(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn the_no_sinks_left_signal_fires_for_a_tee_with_no_sinks_at_all() {
+        let tee = Tee::new(CAP);
+        let signal = tee.no_sinks_left();
+
+        let (src, _) = CountingSrc::new(payload(1024));
+        assert!(tee.run(src).await.early_stop);
+        assert!(
+            *signal.borrow(),
+            "a fan-out with nowhere to write has no audience from the start"
         );
     }
 

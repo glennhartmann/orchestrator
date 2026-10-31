@@ -410,6 +410,59 @@ fn a_data_edge_that_names_no_stream_takes_stdout() {
 }
 
 #[test]
+fn a_node_sigpiped_with_its_sinks_intact_fails_and_blocks_its_dependents() {
+    // SIGPIPE from somewhere other than a vanished consumer — here the node
+    // signals itself — is an ordinary failure: nothing had stopped reading
+    // its output. What must not happen is the summary calling it failed
+    // while its dependents ran anyway, as a SIGPIPE-means-abandoned
+    // shortcut would.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("sig", "kill -PIPE $$")
+        + &sh("dep", "printf ran > {dir}/dep.out")
+        + &order("sig", "dep");
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    assert_eq!(outcome_of(&out, "sig"), "failed (killed by signal 13)");
+    assert_eq!(
+        outcome_of(&out, "dep"),
+        "skipped (sig failed)",
+        "the summary calls sig a failure, so its dependents must be treated \
+         as a failure's dependents"
+    );
+    assert!(!dir.path().join("dep.out").exists());
+    assert_eq!(code(&out), 1);
+}
+
+#[test]
+fn a_node_that_exits_nonzero_after_losing_its_last_consumer_is_abandoned() {
+    // The converse: the consumer leaves, and the producer notices EPIPE and
+    // exits nonzero under its own steam rather than dying of SIGPIPE (it
+    // ignores the signal). It is abandoned, so it counts as success — and
+    // its order dependent must therefore run, not be skipped.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("p", "trap \"\" PIPE; seq 1 200000; exit 7")
+        + &argv("h", &["head", "-1"])
+        + &sh("dep", "printf ran > {dir}/dep.out")
+        + &data("p", "h")
+        + &order("p", "dep");
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    assert_eq!(
+        outcome_of(&out, "p"),
+        "abandoned (its last consumer went away)"
+    );
+    assert_eq!(
+        read(dir.path(), "dep.out"),
+        "ran",
+        "abandonment counts as success, so the dependent must have run"
+    );
+    assert_eq!(outcome_of(&out, "dep"), "succeeded");
+    assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
+}
+
+#[test]
 fn unredirected_output_is_tagged_on_the_right_stream() {
     let graph = sh("n", "echo o; echo e >&2");
 

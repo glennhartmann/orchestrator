@@ -13,7 +13,7 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -56,13 +56,12 @@ struct NodeState {
     decided: Option<Outcome>,
     /// The upstream node whose failure cut this node's stdin short.
     truncated_by: Option<String>,
-    /// One of this node's streams lost its last sink of its own accord, so
-    /// a nonzero exit means it was abandoned rather than broken.
+    /// One of this node's streams had already lost every sink when the node
+    /// exited, so a nonzero exit means it was abandoned rather than broken.
+    /// Read from the fan-out's eager signal at the moment of exit, which is
+    /// both what scheduling needs and the only reading that cannot be
+    /// contaminated by consequences of the exit itself.
     abandoned: bool,
-    /// A sink of this node's own output was cancelled *because this node
-    /// failed*. Losing its consumers that way must not be mistaken for the
-    /// consumers walking out on a healthy producer.
-    self_cancelled: bool,
 }
 
 /// Why one node waits for another.
@@ -108,6 +107,9 @@ struct Runner<'p> {
     /// stdin. Cancelling one releases a producer that the node's unread
     /// queue was throttling.
     stdin_tokens: HashMap<NodeId, CancellationToken>,
+    /// Per node, one "this fan-out has no sinks left" flag per stream it
+    /// produces, so a node's exit can be classified the instant it happens.
+    lost_audience: Vec<Vec<watch::Receiver<bool>>>,
     tees: Vec<TeeHandle>,
     notes: Vec<(String, String)>,
     exit_tx: mpsc::UnboundedSender<(NodeId, io::Result<ExitStatus>)>,
@@ -160,6 +162,7 @@ impl<'p> Runner<'p> {
             },
             stdin_senders,
             stdin_tokens: HashMap::new(),
+            lost_audience: (0..plan.nodes.len()).map(|_| Vec::new()).collect(),
             tees: Vec::new(),
             notes: Vec::new(),
             exit_tx,
@@ -237,10 +240,20 @@ impl<'p> Runner<'p> {
         // Wire up where this node's output is going *before* starting it: a
         // node whose declared destination cannot be opened must not run at
         // all, rather than run and have its results go nowhere.
+        //
+        // Known wart: if a *later* fan-out of the same node fails to open,
+        // the file sinks already opened have been created and truncated by
+        // then, so an empty output file can be left behind for a node that
+        // never ran. The node is reported as having failed to start and the
+        // run exits nonzero, so the file is never the only evidence — but
+        // do not read such a file as "the node ran and produced nothing".
         let mut tees = Vec::new();
         for fanout in self.plan.fanouts.iter().filter(|f| f.source == id) {
             match self.build_tee(fanout) {
-                Ok(tee) => tees.push((fanout.stream, tee)),
+                Ok(tee) => {
+                    self.lost_audience[id.0].push(tee.no_sinks_left());
+                    tees.push((fanout.stream, tee));
+                }
                 Err(e) => return self.spawn_failed(id, e),
             }
         }
@@ -375,18 +388,24 @@ impl<'p> Runner<'p> {
             }
         };
 
-        // Whether a nonzero exit was really an abandonment is only settled
-        // once the node's fan-outs are joined, which can be much later. For
-        // scheduling, death by SIGPIPE stands in: that is how a producer
-        // whose last consumer went away dies.
+        // Read *now*, before anything downstream of this exit happens: a
+        // fan-out that had already run out of sinks is what abandons a
+        // producer, whereas sinks cancelled in response to this very exit
+        // (just below) are a consequence of it and must not excuse it.
+        // Reading the flag at this instant distinguishes the two by timing
+        // alone, and it is the same reading the summary will use, so what
+        // the scheduler does and what the summary says can never disagree.
+        let abandoned = self.lost_audience[id.0].iter().any(|flag| *flag.borrow());
+
         let sched_ok = match observed {
-            ExitObserved::Status(status) => {
-                status.success() || status.signal() == Some(nix::libc::SIGPIPE)
-            }
+            // Abandonment counts as success for scheduling: a producer
+            // whose consumers all walked out has done nothing wrong.
+            ExitObserved::Status(status) => status.success() || abandoned,
             ExitObserved::Unknown => false,
         };
         self.nodes[id.0].exit = Some(observed);
         self.nodes[id.0].sched_ok = sched_ok;
+        self.nodes[id.0].abandoned = abandoned;
 
         if !sched_ok {
             self.propagate_failure(id, id, true);
@@ -418,6 +437,11 @@ impl<'p> Runner<'p> {
 
             let state = &mut self.nodes[dep.node.0];
             if state.started {
+                // Known limitation, per the spec, which describes the direct
+                // case only: if this node goes on to exit 0 with truncated
+                // input, its *own* consumers are not also marked truncated.
+                // The run already fails, so the loss is in the detail of the
+                // summary, not in the verdict.
                 if matches!(dep.kind, DepKind::Data) && state.truncated_by.is_none() {
                     state.truncated_by = Some(because.clone());
                 }
@@ -430,18 +454,8 @@ impl<'p> Runner<'p> {
                 because: because.clone(),
             });
 
-            let producer = match &self.plan.node(dep.node).stdin {
-                StdinSource::Node { from, .. } => Some(*from),
-                _ => None,
-            };
             if let Some(token) = self.stdin_tokens.remove(&dep.node) {
                 token.cancel();
-                // When the queue we just released was fed by the node that
-                // failed, that is the failure costing itself its consumer —
-                // not a consumer walking out, which is what abandonment is.
-                if producer == Some(root) {
-                    self.nodes[root.0].self_cancelled = true;
-                }
             }
             self.propagate_failure(dep.node, root, false);
         }
@@ -484,10 +498,13 @@ impl<'p> Runner<'p> {
         {
             let name = plan.node(node).name.clone();
             let stream = stream_label(stream);
+            // `early_stop` is deliberately not consulted here. It can also
+            // become true *after* the node exited — a consumer leaving once
+            // the producer is already gone — and reading it then would
+            // excuse a node that had genuinely failed on its own. The flag
+            // sampled at the moment of exit is the honest answer.
             let TeeOutcome {
-                early_stop,
-                read_error,
-                sinks,
+                read_error, sinks, ..
             } = match handle.await {
                 Ok(outcome) => outcome,
                 Err(e) => {
@@ -503,12 +520,6 @@ impl<'p> Runner<'p> {
                 if let SinkOutcome::Errored(e) = outcome {
                     self.note(&name, format!("writing {stream} to {sink} failed: {e}"));
                 }
-            }
-            // A stream that ran out of sinks is what abandons a producer —
-            // unless it ran out because this very node's failure got its
-            // consumer skipped, which would otherwise excuse the failure.
-            if early_stop && !self.nodes[node.0].self_cancelled {
-                self.nodes[node.0].abandoned = true;
             }
         }
 
