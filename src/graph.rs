@@ -319,8 +319,20 @@ impl Plan {
                         Some(pb::data_edge::Source::Node(ns)) => {
                             match resolve_node(&ns.node, &name_to_id) {
                                 Some(id) => {
-                                    let stream = pb::Stream::try_from(ns.stream)
-                                        .unwrap_or(pb::Stream::Unspecified);
+                                    // An edge that names no stream means
+                                    // stdout. Resolving it to `Stdout` here
+                                    // rather than carrying `Unspecified`
+                                    // through keeps it the *same* stream as
+                                    // an explicit stdout edge: otherwise it
+                                    // would group into a fan-out of its own
+                                    // and stdout would look unclaimed, so
+                                    // step 8 below would add a second,
+                                    // pass-through fan-out competing for the
+                                    // one stdout pipe.
+                                    let stream = match pb::Stream::try_from(ns.stream) {
+                                        Ok(pb::Stream::Unspecified) | Err(_) => pb::Stream::Stdout,
+                                        Ok(stream) => stream,
+                                    };
                                     Some(ResolvedSource::Node(id, stream))
                                 }
                                 None => {

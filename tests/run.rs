@@ -180,6 +180,36 @@ fn skipping_a_node_releases_the_producer_its_queue_was_throttling() {
 }
 
 #[test]
+fn a_producer_whose_consumer_was_already_skipped_still_finishes() {
+    // `c` is skipped at once (its order edge comes from `bad`), but its
+    // producer `p` only starts a second later, behind `gate`. By then there
+    // is nobody to hand a stdin pipe to, so `p`'s fan-out must release that
+    // sink as it attaches it — otherwise it waits forever for a pipe that
+    // will never arrive and the run never ends.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = argv("bad", &["false"])
+        + &sh("gate", "sleep 1")
+        + &sh("p", "seq 1 100000")
+        + &sh("c", "cat > {dir}/c.out")
+        + &order("gate", "p")
+        + &data("p", "c")
+        + &order("bad", "c");
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    assert_eq!(outcome_of(&out, "c"), "skipped (bad failed)");
+    assert!(!dir.path().join("c.out").exists());
+    // Nothing is left to read p's output, so the orchestrator closes the
+    // pipe and p dies of SIGPIPE: abandoned, not failed.
+    assert!(
+        outcome_of(&out, "p").starts_with("abandoned"),
+        "got {:?}",
+        outcome_of(&out, "p")
+    );
+    assert_eq!(code(&out), 1);
+}
+
+#[test]
 fn unrelated_branches_complete_when_one_node_fails() {
     // `bad` fails immediately while `good` is still running. The parallel
     // branch must finish and write its file regardless.
@@ -357,6 +387,26 @@ fn producer_killed_by_sigpipe_is_abandoned_not_failed() {
         stdout(&out)
     );
     assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
+}
+
+#[test]
+fn a_data_edge_that_names_no_stream_takes_stdout() {
+    // `stream` left out of the edge is the proto's default, zero, i.e.
+    // STREAM_UNSPECIFIED. It must behave as an ordinary stdout edge: the
+    // bytes reach the consumer and stdout counts as claimed, so nothing
+    // passes through and no diagnostic is warranted.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("a", "printf hello")
+        + &sh("b", "cat > {dir}/b.out")
+        + "[[edges]]\n[edges.data]\nnodeStdin = \"b\"\n\n[edges.data.node]\nnode = \"a\"\n\n";
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    assert_eq!(read(dir.path(), "b.out"), "hello");
+    assert_eq!(stdout(&out), "", "the edge claimed a's stdout");
+    let err = stderr(&out);
+    assert!(!err.contains("note:"), "nothing to diagnose here:\n{err}");
+    assert_eq!(code(&out), 0, "stderr:\n{err}");
 }
 
 #[test]
