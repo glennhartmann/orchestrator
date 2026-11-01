@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
@@ -82,21 +83,36 @@ struct NodeState {
 ///   cannot tell the two apart.
 /// - a sink that is simply still there when the producer exits, which is
 ///   the ordinary case and is what `no_sinks_left` being clear means.
+///
+/// `cancelled` is deliberately **fan-out-wide**, not per-sink: one shut sink
+/// disqualifies the whole fan-out. So a producer fanning out to `[c, d]`
+/// where `c` legitimately walks out and `d` is skipped by an unrelated
+/// failure is reported `failed` rather than `abandoned`. Accepted: the
+/// error only ever runs toward calling a nonzero exit a failure, never
+/// toward excusing one, and the run is already failing on `d`'s skip.
 struct Audience {
     /// The fan-out's eager "no sinks left" flag (see `Tee::no_sinks_left`).
     no_sinks_left: watch::Receiver<bool>,
     /// Every destination of this fan-out is another node's stdin, so
     /// emptying the live set really is the graph walking out.
     graph_consumers_only: bool,
-    /// We cancelled one of this fan-out's sinks.
-    cancelled: bool,
+    /// Set when we cancel any of this fan-out's sinks.
+    ///
+    /// Shared with [`Runner::stdin_cancelled`] rather than reached through
+    /// an index into the owning node's `audiences`. An index has to be kept
+    /// in step with a `push` that a later sink's failure to open can skip,
+    /// which is a panic waiting to happen; a handle created before any sink
+    /// can register against it cannot get out of step with anything.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Audience {
     /// Whether this fan-out losing its sinks is grounds for calling its
     /// producer abandoned.
     fn walked_out(&self) -> bool {
-        self.graph_consumers_only && !self.cancelled && *self.no_sinks_left.borrow()
+        self.graph_consumers_only
+            && !self.cancelled.load(Ordering::Relaxed)
+            && *self.no_sinks_left.borrow()
     }
 }
 
@@ -146,10 +162,12 @@ struct Runner<'p> {
     /// Per node, one [`Audience`] per stream it produces, so a node's exit
     /// can be classified the instant it happens.
     audiences: Vec<Vec<Audience>>,
-    /// Which fan-out feeds a given node's stdin, as `(producer, slot into
-    /// that producer's `audiences`)`. Lets cancelling a sink be recorded
-    /// against the fan-out that was feeding it.
-    stdin_sink_slot: HashMap<NodeId, (NodeId, usize)>,
+    /// The "a sink of mine was cancelled" flag of whichever fan-out feeds a
+    /// given node's stdin, so releasing that node's sink can be recorded
+    /// against the fan-out that was feeding it. Shares the flag with that
+    /// [`Audience`]; see its `cancelled` field for why this is a handle
+    /// rather than an index.
+    stdin_cancelled: HashMap<NodeId, Arc<AtomicBool>>,
     tees: Vec<TeeHandle>,
     notes: Vec<(String, String)>,
     exit_tx: mpsc::UnboundedSender<(NodeId, io::Result<ExitStatus>)>,
@@ -203,7 +221,7 @@ impl<'p> Runner<'p> {
             stdin_senders,
             stdin_tokens: HashMap::new(),
             audiences: (0..plan.nodes.len()).map(|_| Vec::new()).collect(),
-            stdin_sink_slot: HashMap::new(),
+            stdin_cancelled: HashMap::new(),
             tees: Vec::new(),
             notes: Vec::new(),
             exit_tx,
@@ -394,9 +412,13 @@ impl<'p> Runner<'p> {
         let plan = self.plan;
         let source = plan.node(fanout.source).name.clone();
         let mut tee = Tee::new(plan.queue_cap_bytes);
-        let slot = self.audiences[fanout.source.0].len();
         let mut graph_consumers_only = true;
-        let mut cancelled = false;
+        // Created before the loop, so every sink that registers against it
+        // below shares a flag that already exists. Nothing here depends on
+        // this fan-out's `Audience` having been pushed — which the `?` below
+        // can skip entirely — so a later sink failing to open cannot leave a
+        // dangling reference behind.
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         for spec in &fanout.sinks {
             let label = sink_label(plan, spec);
@@ -415,14 +437,13 @@ impl<'p> Runner<'p> {
             // node's stdin and nowhere else.
             match spec {
                 SinkSpec::NodeStdin(consumer) => {
-                    self.stdin_sink_slot
-                        .insert(*consumer, (fanout.source, slot));
+                    self.stdin_cancelled.insert(*consumer, cancelled.clone());
                     if self.nodes[consumer.0].decided.is_some() {
                         // Already skipped or failed to start before its
                         // producer even began; release the queue now rather
                         // than let it fill for nobody.
                         token.cancel();
-                        cancelled = true;
+                        cancelled.store(true, Ordering::Relaxed);
                     } else {
                         self.stdin_tokens.insert(*consumer, token);
                     }
@@ -447,12 +468,14 @@ impl<'p> Runner<'p> {
         if let Some(token) = self.stdin_tokens.remove(&consumer) {
             token.cancel();
         }
-        // Dropping the sender closes the pipe for a sink that has not yet
-        // been connected, so a `Pending` sink waiting on this node's stdin
-        // stops waiting instead of pinning its producer forever.
+        // Belt and braces. Cancelling the token above is already enough to
+        // stop a `Pending` sink waiting for this node's stdin: `drain_sink`
+        // races the token against the write, the oneshot await lives inside
+        // that write, and `CloseOnDrop` frees the permits either way.
+        // Dropping the sender simply closes the pipe for good.
         self.stdin_senders.remove(&consumer);
-        if let Some((producer, slot)) = self.stdin_sink_slot.get(&consumer).copied() {
-            self.audiences[producer.0][slot].cancelled = true;
+        if let Some(cancelled) = self.stdin_cancelled.get(&consumer) {
+            cancelled.store(true, Ordering::Relaxed);
         }
     }
 

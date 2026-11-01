@@ -610,6 +610,59 @@ fn a_consumer_that_fails_to_start_releases_the_producer_it_was_throttling() {
 }
 
 #[test]
+fn an_unopenable_file_alongside_a_consumer_in_one_fanout_still_reports() {
+    // One fan-out with two destinations: a consumer's stdin *and* a file
+    // that cannot be opened. Building the fan-out fails on the file after
+    // the consumer has already been registered against it, so a scheduler
+    // that tracked the consumer by an index into a list it then never
+    // appended to would panic here instead of reporting anything.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("p", "printf hi")
+        + &sh("c", "cat > {dir}/c.out")
+        + &data("p", "c")
+        + &data_to_file("p", "{dir}");
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    let outcome = outcome_of(&out, "p");
+    assert!(
+        outcome.starts_with("failed to start:") && outcome.contains("cannot reach"),
+        "got {outcome}"
+    );
+    assert_eq!(outcome_of(&out, "c"), "skipped (p failed)");
+    assert!(!dir.path().join("c.out").exists());
+    assert_eq!(code(&out), 1);
+}
+
+#[test]
+fn an_unopenable_file_in_a_second_fanout_still_reports() {
+    // The same shape, but the failing fan-out is the node's *second*
+    // (stderr): its consumer is registered after a first, successful
+    // fan-out, so an index recorded for it points one past the end rather
+    // than at nothing. Both shapes have to be safe, not just the first.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("p", "printf hi")
+        + &sh("c", "cat > {dir}/c.out")
+        + &sh("d", "cat > {dir}/d.out")
+        + &data("p", "c")
+        + &data_stderr("p", "d")
+        + &data_stderr_to_file("p", "{dir}");
+
+    let out = run_graph_in(dir.path(), &graph);
+
+    let outcome = outcome_of(&out, "p");
+    assert!(
+        outcome.starts_with("failed to start:") && outcome.contains("cannot reach"),
+        "got {outcome}"
+    );
+    assert_eq!(outcome_of(&out, "c"), "skipped (p failed)");
+    assert_eq!(outcome_of(&out, "d"), "skipped (p failed)");
+    assert!(!dir.path().join("c.out").exists());
+    assert!(!dir.path().join("d.out").exists());
+    assert_eq!(code(&out), 1);
+}
+
+#[test]
 fn a_node_whose_output_sink_cannot_be_opened_does_not_run() {
     // The sink path is an existing directory, so it passes validation (its
     // parent is writable) and only fails when opened. Running the node

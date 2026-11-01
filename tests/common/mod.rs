@@ -183,6 +183,20 @@ pub fn data_to_file(from: &str, path: &str) -> String {
     )
 }
 
+/// A data edge from `from`'s **stderr** to `to`'s stdin.
+pub fn data_stderr(from: &str, to: &str) -> String {
+    format!(
+        "[[edges]]\n[edges.data]\nnodeStdin = \"{to}\"\n\n[edges.data.node]\nnode = \"{from}\"\nstream = \"STREAM_STDERR\"\n\n"
+    )
+}
+
+/// A data edge from `from`'s **stderr** to a file.
+pub fn data_stderr_to_file(from: &str, path: &str) -> String {
+    format!(
+        "[[edges]]\n[edges.data]\n\n[edges.data.fileSink]\npath = \"{path}\"\n\n[edges.data.node]\nnode = \"{from}\"\nstream = \"STREAM_STDERR\"\n\n"
+    )
+}
+
 /// A `[options]` table setting the per-sink queue cap. Must come last in a
 /// fixture: every `[[nodes]]`/`[[edges]]` entry after it would be nested
 /// inside it.
