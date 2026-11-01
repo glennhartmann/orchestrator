@@ -34,6 +34,13 @@ pub enum Outcome {
     Skipped {
         because: String,
     },
+    /// Never started, not because anything failed but because the
+    /// orchestrator was shut down (SIGINT/SIGTERM) before scheduling got to
+    /// it. Kept separate from [`Self::Skipped`]: that variant's `because`
+    /// names a *culprit node* and is rendered into "skipped ({because}
+    /// failed)" — a shutdown reason does not fit that template, and
+    /// stuffing it in there read as broken English.
+    Interrupted,
 }
 
 /// What every node did, plus any per-node diagnostics that are not
@@ -82,6 +89,9 @@ impl Outcome {
             } => "failed (unknown exit status)".to_string(),
             Outcome::SpawnFailed { message } => format!("failed to start: {message}"),
             Outcome::Skipped { because } => format!("skipped ({because} failed)"),
+            Outcome::Interrupted => {
+                "never started (the orchestrator was shut down by a signal)".to_string()
+            }
         }
     }
 }

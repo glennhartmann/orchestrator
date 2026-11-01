@@ -617,21 +617,24 @@ impl<'p> Runner<'p> {
         let plan = self.plan;
 
         // In a validated (acyclic) plan every node either starts or is
-        // skipped by propagation, so this changes nothing. It is here
-        // because the alternative to deciding a stranded node is hanging
-        // below, waiting for a fan-out whose stdin pipe will never arrive.
-        let stranded_because = if self.interrupted {
-            "the orchestrator was shut down by a signal".to_string()
-        } else {
-            "an upstream node".to_string()
-        };
+        // skipped by propagation, so absent a signal this changes nothing.
+        // It is here because the alternative to deciding a stranded node is
+        // hanging below, waiting for a fan-out whose stdin pipe will never
+        // arrive. Once interrupted, this is in fact the normal way a
+        // never-scheduled node gets decided: nothing failed it, scheduling
+        // just stopped, so it gets its own outcome rather than a `Skipped`
+        // whose `because` is meant to name a culprit node.
         for i in 0..plan.nodes.len() {
             let state = &self.nodes[i];
             if state.started || state.decided.is_some() || state.exit.is_some() {
                 continue;
             }
-            self.nodes[i].decided = Some(Outcome::Skipped {
-                because: stranded_because.clone(),
+            self.nodes[i].decided = Some(if self.interrupted {
+                Outcome::Interrupted
+            } else {
+                Outcome::Skipped {
+                    because: "an upstream node".to_string(),
+                }
             });
             self.release_stdin_sink(NodeId(i));
         }

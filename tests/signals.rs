@@ -84,9 +84,10 @@ fn sigterm_stops_scheduling_and_terminates_children() {
         stderr(&out)
     );
     assert!(
-        elapsed < Duration::from_secs(5),
-        "shutdown took {elapsed:?}, far longer than the 2s grace — it waited the full \
-         sleep instead of reacting to the signal"
+        elapsed < Duration::from_secs(1),
+        "shutdown took {elapsed:?} against a 2s grace with children that die the instant \
+         they're SIGTERMed — it must have unconditionally slept out the grace instead of \
+         returning as soon as both children were gone"
     );
 
     assert_gone(a_pid, "a's sleep");
@@ -132,6 +133,53 @@ fn a_child_that_ignores_sigterm_is_killed_after_the_grace_period() {
     );
 
     assert_gone(pid, "the stubborn child");
+}
+
+#[test]
+fn a_node_still_gated_behind_an_order_edge_when_the_signal_lands_is_reported_sensibly() {
+    // `gated`'s order edge is `anyExit = true`, so it tolerates `a` failing
+    // — `a` dying from the forwarded SIGTERM does not block or
+    // skip-propagate to `gated` (see `propagate_failure`'s `blocked`
+    // check). That leaves `gated` genuinely never started and never
+    // decided by anything else: it can only be decided by `finish`'s
+    // stranded-node fallback, deterministically, because scheduling was
+    // stopped (`self.interrupted`) before `a`'s exit was even processed.
+    // That fallback must not render through the `Skipped { because }`
+    // template, which is meant for a named culprit node and reads as
+    // broken English when fed a shutdown reason instead ("skipped (the
+    // orchestrator was shut down by a signal failed)").
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("a", "echo $$ > {dir}/a.pid; sleep 60")
+        + &sh("gated", "true")
+        + &order_any_exit("a", "gated")
+        + &shutdown_grace_ms(2000);
+
+    let child = spawn_graph_in(dir.path(), &graph);
+    let orchestrator_pid = child.id() as i32;
+
+    let a_pid = wait_for_pid(&dir.path().join("a.pid"), Duration::from_secs(10));
+    assert!(alive(a_pid), "a should be running before the signal");
+
+    signal::kill(Pid::from_raw(orchestrator_pid), Signal::SIGTERM)
+        .expect("send SIGTERM to the orchestrator");
+
+    let out = wait_within(child, Duration::from_secs(10));
+
+    assert_ne!(
+        code(&out),
+        0,
+        "a signalled run must exit nonzero\nstderr:\n{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        outcome_of(&out, "gated"),
+        "never started (the orchestrator was shut down by a signal)",
+        "a node stranded by shutdown must not be rendered through the culprit-node \
+         template:\n{}",
+        stderr(&out)
+    );
+
+    assert_gone(a_pid, "a's sleep");
 }
 
 #[test]
