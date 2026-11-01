@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::child::{spawn, stdio_for};
+use crate::exec::signals;
 use crate::exec::sinks::{SinkCtx, build_sink};
 use crate::exec::tee::{SinkOutcome, Tee, TeeOutcome};
 use crate::graph::{Fanout, NodeId, Plan, SinkSpec, StdinSource};
@@ -48,6 +49,10 @@ struct NodeState {
     /// True once the process exists. A data-edge consumer becomes runnable
     /// on this, not on its producer's exit.
     started: bool,
+    /// The process group this node's child was placed in, set the moment
+    /// it is spawned. `shutdown` signals this, not the pid directly, so a
+    /// child's own forked descendants are reached too.
+    pgid: Option<i32>,
     exit: Option<ExitObserved>,
     /// Whether this node's exit lets its order-edge dependents run. Only
     /// meaningful once `exit` is set.
@@ -173,6 +178,10 @@ struct Runner<'p> {
     exit_tx: mpsc::UnboundedSender<(NodeId, io::Result<ExitStatus>)>,
     exit_rx: mpsc::UnboundedReceiver<(NodeId, io::Result<ExitStatus>)>,
     running: usize,
+    /// Set once SIGINT or SIGTERM is handled. Stops any further node from
+    /// being spawned and forces the run to report nonzero regardless of
+    /// how the nodes themselves turned out.
+    interrupted: bool,
 }
 
 impl<'p> Runner<'p> {
@@ -227,28 +236,70 @@ impl<'p> Runner<'p> {
             exit_tx,
             exit_rx,
             running: 0,
+            interrupted: false,
         }
     }
 
     async fn run(mut self) -> Report {
+        // One future for the whole run, polled from the select loop below
+        // until it resolves once. A repeat SIGINT or SIGTERM during
+        // shutdown is deliberately not handled a second time (the `if
+        // !self.interrupted` guard stops polling it at all) — the grace
+        // period and the eventual SIGKILL sweep are the only response a
+        // second signal gets.
+        let shutdown_signal = signals::wait_for_shutdown_signal();
+        tokio::pin!(shutdown_signal);
+
         loop {
             // Spawning a node can make others runnable (a data consumer
             // waits only for its producer to *start*), so keep going until
-            // nothing more can be spawned — then, and only then, wait.
-            while self.spawn_runnable_nodes() {}
+            // nothing more can be spawned — then, and only then, wait. Once
+            // interrupted, no further node is ever spawned.
+            if !self.interrupted {
+                while self.spawn_runnable_nodes() {}
+            }
 
             if self.running == 0 {
                 break;
             }
-            let (id, status) = self
-                .exit_rx
-                .recv()
-                .await
-                .expect("the runner holds a sender for the whole run");
-            self.running -= 1;
-            self.handle_exit(id, status);
+
+            tokio::select! {
+                exit = self.exit_rx.recv() => {
+                    let (id, status) = exit.expect("the runner holds a sender for the whole run");
+                    self.running -= 1;
+                    self.handle_exit(id, status);
+                }
+                () = &mut shutdown_signal, if !self.interrupted => {
+                    self.handle_signal().await;
+                }
+            }
         }
         self.finish().await
+    }
+
+    /// Reacts to the first SIGINT/SIGTERM: stops scheduling (checked by the
+    /// caller), forwards the signal to every live child's process group,
+    /// and waits out the grace period before anything left gets SIGKILLed.
+    /// `self.running` still only reaches zero once every per-child `wait`
+    /// task reports its exit, so this never reaps anything itself — it
+    /// only makes sure those exits actually happen soon.
+    async fn handle_signal(&mut self) {
+        self.interrupted = true;
+        let live: Vec<(String, i32)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, state)| {
+                if state.started && state.exit.is_none() {
+                    state
+                        .pgid
+                        .map(|pgid| (self.plan.node(NodeId(i)).name.clone(), pgid))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        signals::shutdown(&live, self.plan.shutdown_grace).await;
     }
 
     /// Spawns every node that is runnable right now. Returns whether it
@@ -322,6 +373,7 @@ impl<'p> Runner<'p> {
             Err(e) => return self.spawn_failed(id, e),
         };
         self.nodes[id.0].started = true;
+        self.nodes[id.0].pgid = Some(spawned.pgid);
 
         if let Some(tx) = self.stdin_senders.remove(&id) {
             // Hands the write end of this node's stdin to the sink already
@@ -568,13 +620,18 @@ impl<'p> Runner<'p> {
         // skipped by propagation, so this changes nothing. It is here
         // because the alternative to deciding a stranded node is hanging
         // below, waiting for a fan-out whose stdin pipe will never arrive.
+        let stranded_because = if self.interrupted {
+            "the orchestrator was shut down by a signal".to_string()
+        } else {
+            "an upstream node".to_string()
+        };
         for i in 0..plan.nodes.len() {
             let state = &self.nodes[i];
             if state.started || state.decided.is_some() || state.exit.is_some() {
                 continue;
             }
             self.nodes[i].decided = Some(Outcome::Skipped {
-                because: "an upstream node".to_string(),
+                because: stranded_because.clone(),
             });
             self.release_stdin_sink(NodeId(i));
         }
@@ -648,6 +705,7 @@ impl<'p> Runner<'p> {
         Report {
             entries,
             notes: self.notes,
+            interrupted: self.interrupted,
         }
     }
 

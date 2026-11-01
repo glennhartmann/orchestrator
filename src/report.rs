@@ -47,6 +47,12 @@ pub struct Report {
     /// failed to open or to write. Reported under the node's entry so they
     /// are never silent.
     pub notes: Vec<(String, String)>,
+    /// Set once the run received SIGINT or SIGTERM. Forces a nonzero exit
+    /// code even in the (racy) case where every node had already succeeded
+    /// by the time the signal was handled: the operator asked this run to
+    /// stop, so it is not a clean success regardless of what the nodes
+    /// themselves report.
+    pub interrupted: bool,
 }
 
 impl Outcome {
@@ -84,7 +90,11 @@ impl Report {
     /// Writes the human-readable summary. The caller sends this to stderr:
     /// stdout belongs to the nodes' pass-through output.
     pub fn write(&self, w: &mut impl io::Write) -> io::Result<()> {
-        writeln!(w, "run summary:")?;
+        if self.interrupted {
+            writeln!(w, "run summary (interrupted by signal):")?;
+        } else {
+            writeln!(w, "run summary:")?;
+        }
         if self.entries.is_empty() {
             writeln!(w, "  (no nodes)")?;
         }
@@ -99,8 +109,12 @@ impl Report {
 
     /// `0` if every node succeeded or was abandoned, `1` otherwise. A
     /// truncated-input node exited 0 but still makes the *run* a failure,
-    /// because its results are wrong.
+    /// because its results are wrong. A signalled run is always nonzero,
+    /// even if every node happened to have already succeeded.
     pub fn exit_code(&self) -> i32 {
+        if self.interrupted {
+            return 1;
+        }
         let all_good = self
             .entries
             .iter()
@@ -120,6 +134,7 @@ mod tests {
                 .map(|(n, o)| (n.to_string(), o.clone()))
                 .collect(),
             notes: Vec::new(),
+            interrupted: false,
         }
     }
 
@@ -224,6 +239,24 @@ mod tests {
         assert!(
             text.contains("exit 3"),
             "a failure must report its exit status:\n{text}"
+        );
+    }
+
+    #[test]
+    fn interrupted_run_exits_nonzero_even_if_every_node_succeeded() {
+        let mut r = report(&[("a", Outcome::Succeeded), ("b", Outcome::Succeeded)]);
+        assert_eq!(r.exit_code(), 0, "sanity: not interrupted, all succeeded");
+
+        r.interrupted = true;
+        assert_eq!(
+            r.exit_code(),
+            1,
+            "a signalled run must exit nonzero even though every node succeeded"
+        );
+        assert!(
+            summary(&r).contains("interrupted"),
+            "the summary should say the run was interrupted:\n{}",
+            summary(&r)
         );
     }
 
