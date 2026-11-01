@@ -92,8 +92,45 @@ fn apply_overrides(graph: &mut pb::Graph, args: &GraphArgs) {
     }
 }
 
+/// The name of the node a [`graph::NodeId`] resolves to in `plan`.
+fn node_name(plan: &Plan, id: orchestrator::graph::NodeId) -> &str {
+    &plan.nodes[id.0].name
+}
+
+/// Lowercases a `pb::Stream`'s wire name (`"STREAM_STDOUT"` -> `"stdout"`)
+/// for prose rather than protobuf plumbing.
+fn stream_name(stream: pb::Stream) -> &'static str {
+    match stream {
+        pb::Stream::Unspecified => "unspecified",
+        pb::Stream::Stdout => "stdout",
+        pb::Stream::Stderr => "stderr",
+        pb::Stream::Both => "both",
+    }
+}
+
+/// One sink, in prose: a node's stdin by name, a file with its path and
+/// append mode, or "passthrough" naming the stream it falls through to.
+fn describe_sink(plan: &Plan, sink: &orchestrator::graph::SinkSpec) -> String {
+    use orchestrator::graph::SinkSpec;
+    match sink {
+        SinkSpec::NodeStdin(id) => format!("{}'s stdin", node_name(plan, *id)),
+        SinkSpec::File { path, append } => {
+            format!(
+                "file {} ({})",
+                path.display(),
+                if *append { "append" } else { "truncate" }
+            )
+        }
+        SinkSpec::Passthrough(stream) => {
+            format!("passthrough ({})", stream_name(*stream))
+        }
+    }
+}
+
 /// Prints the resolved plan: every node, its fanouts, and the effective
-/// options, so `validate` is useful for more than a bare pass/fail.
+/// options, so `validate` is useful for more than a bare pass/fail. Node
+/// identity is always shown by name — an operator reading this should
+/// never have to map an internal index back to their own graph.
 fn print_plan(plan: &Plan, w: &mut impl std::io::Write) {
     let _ = writeln!(w, "plan:");
     let _ = writeln!(
@@ -109,10 +146,17 @@ fn print_plan(plan: &Plan, w: &mut impl std::io::Write) {
     }
     let _ = writeln!(w, "  fanouts:");
     for fanout in &plan.fanouts {
+        let sinks: Vec<String> = fanout
+            .sinks
+            .iter()
+            .map(|s| describe_sink(plan, s))
+            .collect();
         let _ = writeln!(
             w,
-            "    {} ({:?}) -> {:?}",
-            plan.nodes[fanout.source.0].name, fanout.stream, fanout.sinks
+            "    {}'s {} -> {}",
+            node_name(plan, fanout.source),
+            stream_name(fanout.stream),
+            sinks.join(", ")
         );
     }
 }

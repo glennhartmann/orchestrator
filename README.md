@@ -128,16 +128,16 @@ orchestrator dot <graph> [--format ..] [--no-tags] [--queue-cap-bytes N] [--shut
       d ["true"]
       e ["cat"]
     fanouts:
-      a (Stdout) -> [NodeStdin(NodeId(2))]
-      c (Stdout) -> [NodeStdin(NodeId(4))]
-      a (Stderr) -> [Passthrough(Stderr)]
-      b (Stdout) -> [Passthrough(Stdout)]
-      b (Stderr) -> [Passthrough(Stderr)]
-      c (Stderr) -> [Passthrough(Stderr)]
-      d (Stdout) -> [Passthrough(Stdout)]
-      d (Stderr) -> [Passthrough(Stderr)]
-      e (Stdout) -> [Passthrough(Stdout)]
-      e (Stderr) -> [Passthrough(Stderr)]
+      a's stdout -> c's stdin
+      c's stdout -> e's stdin
+      a's stderr -> passthrough (stderr)
+      b's stdout -> passthrough (stdout)
+      b's stderr -> passthrough (stderr)
+      c's stderr -> passthrough (stderr)
+      d's stdout -> passthrough (stdout)
+      d's stderr -> passthrough (stderr)
+      e's stdout -> passthrough (stdout)
+      e's stderr -> passthrough (stderr)
   ```
 
 - **`dot`** prints the resolved plan as a Graphviz `digraph` on stdout, for

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::config::Format;
+use orchestrator::config::Format;
 
 /// Runs a DAG of programs with streamed stdout/stderr between them.
 #[derive(Debug, Parser)]
