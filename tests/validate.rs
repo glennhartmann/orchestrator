@@ -556,6 +556,34 @@ fn rejects_a_file_source_that_exists_but_cannot_be_read() {
 }
 
 #[test]
+fn a_fifo_file_source_does_not_block_validation() {
+    // `File::open` on a FIFO with no writer blocks until one arrives, where
+    // the old `fs::metadata` check returned immediately. `validate` is a
+    // cheap pre-flight, so the readability probe must never wait on another
+    // process. Run on its own thread so a regression fails the test instead
+    // of hanging the suite forever.
+    let dir = tempdir("fifo-source");
+    let path = dir.join("pipe");
+    let _ = std::fs::remove_file(&path);
+    nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o644))
+        .expect("create a FIFO");
+
+    let g = graph(
+        vec![node("a", &["cat"])],
+        vec![data_file_to_stdin(path.to_str().unwrap(), "a")],
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(Plan::from_proto(g).is_ok());
+    });
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(accepted) => assert!(accepted, "a readable FIFO is a usable file source"),
+        Err(_) => panic!("validation blocked on a FIFO with no writer"),
+    }
+}
+
+#[test]
 fn validation_creates_no_files() {
     let dir = tempdir("no-side-effects");
     let sink_path = dir.join("out.txt");

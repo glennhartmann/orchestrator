@@ -240,6 +240,29 @@ fn reaches(adj: &[Vec<NodeId>], from: NodeId, to: NodeId) -> bool {
     false
 }
 
+/// True if `path` can actually be opened for reading.
+///
+/// Opening is the only way to tell a readable file from one that merely
+/// exists — `stat` succeeds on a mode-000 file — and reading has no side
+/// effects, so it is allowed here where opening an *output* path is not.
+///
+/// `O_NONBLOCK` is essential, not an optimization: a blocking open of a
+/// FIFO waits for a writer to appear, which would hang `validate`
+/// indefinitely on a graph whose input is a named pipe. With the flag the
+/// open returns at once for every file type while still reporting
+/// ENOENT/EACCES, which is all this check is asking about. The flag is not
+/// inherited by anything — the handle is dropped immediately, and the real
+/// open at spawn time ([`crate::exec::child::stdio_for`]) is a separate,
+/// deliberately blocking one.
+fn is_readable(path: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(path)
+        .is_ok()
+}
+
 /// True if `dir` exists, is a directory, and appears writable.
 fn dir_is_writable(dir: &Path) -> bool {
     match std::fs::metadata(dir) {
@@ -585,7 +608,7 @@ impl Plan {
         // has no side effects and is the only way to tell a readable file
         // from one that merely exists (`stat` succeeds on mode 000).
         for path in &file_source_paths {
-            if std::fs::File::open(path).is_err() {
+            if !is_readable(path) {
                 errors.push(ValidationError::UnreadableFileSource(path.clone()));
             }
         }
