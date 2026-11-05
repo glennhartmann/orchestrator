@@ -23,6 +23,18 @@ pub enum Outcome {
         destination: String,
         error: String,
     },
+    /// Took SIGPIPE because the *orchestrator's own* stdout or stderr had
+    /// gone away — `orchestrator run g | head -1` — so we closed our read
+    /// end of this node's stream and it died writing into it.
+    ///
+    /// Distinct from [`Self::Abandoned`], where the departed consumer was
+    /// another node, and from [`Self::Failed`], where the node died on its
+    /// own account. Like abandonment it counts as success: every node's
+    /// work completed and the only consumer that left was our own terminal,
+    /// which is the `yes | head -1` case one level out.
+    PassthroughGone {
+        destination: String,
+    },
     Failed {
         code: Option<i32>,
         signal: Option<i32>,
@@ -75,6 +87,9 @@ impl Outcome {
             Outcome::LostOutput { destination, error } => {
                 format!("exited 0 but its output to {destination} failed: {error}")
             }
+            Outcome::PassthroughGone { destination } => {
+                format!("stopped when {destination} went away (killed by signal 13)")
+            }
             Outcome::Failed {
                 code: Some(code),
                 signal: _,
@@ -117,7 +132,8 @@ impl Report {
         Ok(())
     }
 
-    /// `0` if every node succeeded or was abandoned, `1` otherwise. A
+    /// `0` if every node succeeded, was abandoned, or died only because the
+    /// orchestrator's own stdout/stderr went away, `1` otherwise. A
     /// truncated-input node exited 0 but still makes the *run* a failure,
     /// because its results are wrong. A signalled run is always nonzero,
     /// even if every node happened to have already succeeded.
@@ -125,10 +141,12 @@ impl Report {
         if self.interrupted {
             return 1;
         }
-        let all_good = self
-            .entries
-            .iter()
-            .all(|(_, o)| matches!(o, Outcome::Succeeded | Outcome::Abandoned));
+        let all_good = self.entries.iter().all(|(_, o)| {
+            matches!(
+                o,
+                Outcome::Succeeded | Outcome::Abandoned | Outcome::PassthroughGone { .. }
+            )
+        });
         if all_good { 0 } else { 1 }
     }
 }
@@ -168,6 +186,30 @@ mod tests {
             .exit_code(),
             0,
             "a node abandoned once its last consumer went away is not a failure"
+        );
+    }
+
+    #[test]
+    fn a_node_we_sigpiped_for_our_own_departed_stdout_is_not_a_failing_run() {
+        let r = report(&[(
+            "a",
+            Outcome::PassthroughGone {
+                destination: "the orchestrator's stdout".to_string(),
+            },
+        )]);
+        assert_eq!(
+            r.exit_code(),
+            0,
+            "the node's work completed; only our own terminal left"
+        );
+        let text = summary(&r);
+        assert!(
+            text.contains("the orchestrator's stdout went away"),
+            "the summary must name what went away rather than show a bare signal:\n{text}"
+        );
+        assert!(
+            !text.contains("failed"),
+            "this death must not read as the node's own failure:\n{text}"
         );
     }
 

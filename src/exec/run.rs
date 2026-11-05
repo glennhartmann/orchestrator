@@ -26,6 +26,10 @@ use crate::graph::{Fanout, NodeId, Plan, SinkSpec, StdinSource};
 use crate::pb;
 use crate::report::{Outcome, Report};
 
+/// SIGPIPE's number — the death a producer takes when the orchestrator
+/// drops its read end of that producer's stream.
+const SIGPIPE: i32 = nix::sys::signal::Signal::SIGPIPE as i32;
+
 /// Runs `plan` to quiescence and reports what every node did.
 ///
 /// Pass-through output goes to the process's own stdout/stderr as it is
@@ -69,6 +73,10 @@ struct NodeState {
     /// A destination that failed mid-stream, with the error — the node's
     /// output went on the floor even though the node itself exited 0.
     lost_output: Option<(String, String)>,
+    /// Set when this node took SIGPIPE because the *orchestrator's* own
+    /// stdout or stderr had gone away, naming it. Sampled at the instant of
+    /// exit, like `abandoned`, and for the same reason.
+    passthrough_gone: Option<String>,
 }
 
 /// What became of one fan-out's set of destinations, as far as deciding
@@ -101,6 +109,16 @@ struct Audience {
     /// Every destination of this fan-out is another node's stdin, so
     /// emptying the live set really is the graph walking out.
     graph_consumers_only: bool,
+    /// The stream this fan-out carries, for the diagnostic below.
+    stream: pb::Stream,
+    /// Set when this fan-out's single destination is the orchestrator's own
+    /// stdout or stderr, naming it.
+    ///
+    /// Only ever `Some` for a *pure* pass-through fan-out: the plan adds one
+    /// only for a stream no data edge claimed, with exactly that one sink.
+    /// So this and `graph_consumers_only` are never both set, and the two
+    /// classifications they drive cannot collide.
+    passthrough: Option<String>,
     /// Set when we cancel any of this fan-out's sinks.
     ///
     /// Shared with [`Runner::stdin_cancelled`] rather than reached through
@@ -118,6 +136,20 @@ impl Audience {
         self.graph_consumers_only
             && !self.cancelled.load(Ordering::Relaxed)
             && *self.no_sinks_left.borrow()
+    }
+
+    /// Whether this fan-out lost the orchestrator's own stdout/stderr, which
+    /// is what makes dropping the source — and so the producer's SIGPIPE —
+    /// our doing rather than the node's fault. Returns the stream that was
+    /// closed and the departed destination's name.
+    ///
+    /// Sampled at the same instant as [`Self::walked_out`], and with the
+    /// same `cancelled` guard, which here is belt and braces: a
+    /// pass-through sink is never cancelled.
+    fn passthrough_departed(&self) -> Option<(pb::Stream, &str)> {
+        let destination = self.passthrough.as_deref()?;
+        (!self.cancelled.load(Ordering::Relaxed) && *self.no_sinks_left.borrow())
+            .then_some((self.stream, destination))
     }
 }
 
@@ -465,6 +497,7 @@ impl<'p> Runner<'p> {
         let source = plan.node(fanout.source).name.clone();
         let mut tee = Tee::new(plan.queue_cap_bytes);
         let mut graph_consumers_only = true;
+        let mut passthrough = None;
         // Created before the loop, so every sink that registers against it
         // below shares a flag that already exists. Nothing here depends on
         // this fan-out's `Audience` having been pushed — which the `?` below
@@ -500,13 +533,19 @@ impl<'p> Runner<'p> {
                         self.stdin_tokens.insert(*consumer, token);
                     }
                 }
-                SinkSpec::File { .. } | SinkSpec::Passthrough(_) => graph_consumers_only = false,
+                SinkSpec::File { .. } => graph_consumers_only = false,
+                SinkSpec::Passthrough(_) => {
+                    graph_consumers_only = false;
+                    passthrough = Some(sink_label(plan, spec));
+                }
             }
         }
 
         self.audiences[fanout.source.0].push(Audience {
             no_sinks_left: tee.no_sinks_left(),
             graph_consumers_only,
+            stream: fanout.stream,
+            passthrough,
             cancelled,
         });
         Ok(tee)
@@ -549,15 +588,49 @@ impl<'p> Runner<'p> {
         // scheduler does and what the summary says can never disagree.
         let abandoned = self.audiences[id.0].iter().any(Audience::walked_out);
 
+        // The other way we can be the proximate cause of a node's death:
+        // our own stdout (or stderr) went away — we were piped into `head`
+        // — which left a pass-through fan-out with no sinks, so the tee
+        // dropped its read end and the node took SIGPIPE writing into it.
+        //
+        // Restricted to a SIGPIPE death on purpose. A node that chose its
+        // own nonzero exit status failed on its own account, whatever
+        // happened to our stdout, which is what keeps
+        // `a_broken_orchestrator_stdout_does_not_excuse_a_failing_node`
+        // true. Sampled here, with the same `cancelled` guard as
+        // abandonment, so a sink we shut on another node's behalf can never
+        // excuse anything.
+        let passthrough_gone = match observed {
+            ExitObserved::Status(status) if status.signal() == Some(SIGPIPE) => self.audiences
+                [id.0]
+                .iter()
+                .find_map(Audience::passthrough_departed)
+                .map(|(stream, destination)| (stream, destination.to_string())),
+            _ => None,
+        };
+        if let Some((stream, destination)) = &passthrough_gone {
+            self.note(
+                &name,
+                format!(
+                    "{} was closed from our end once {destination} went away",
+                    stream_label(*stream)
+                ),
+            );
+        }
+
         let sched_ok = match observed {
-            // Abandonment counts as success for scheduling: a producer
-            // whose consumers all walked out has done nothing wrong.
-            ExitObserved::Status(status) => status.success() || abandoned,
+            // Both of these count as success for scheduling: a producer
+            // whose consumers all walked out, or whose only destination was
+            // our own departed stdout, has done nothing wrong.
+            ExitObserved::Status(status) => {
+                status.success() || abandoned || passthrough_gone.is_some()
+            }
             ExitObserved::Unknown => false,
         };
         self.nodes[id.0].exit = Some(observed);
         self.nodes[id.0].sched_ok = sched_ok;
         self.nodes[id.0].abandoned = abandoned;
+        self.nodes[id.0].passthrough_gone = passthrough_gone.map(|(_, destination)| destination);
 
         if !sched_ok {
             self.propagate_failure(id, id, true);
@@ -750,6 +823,10 @@ impl<'p> Runner<'p> {
             }
         } else if state.abandoned {
             Outcome::Abandoned
+        } else if let Some(destination) = &state.passthrough_gone {
+            Outcome::PassthroughGone {
+                destination: destination.clone(),
+            }
         } else {
             Outcome::Failed {
                 code: status.code(),

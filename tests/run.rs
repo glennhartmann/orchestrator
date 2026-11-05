@@ -481,6 +481,35 @@ fn a_broken_orchestrator_stdout_does_not_excuse_a_failing_node() {
 }
 
 #[test]
+fn a_node_we_sigpiped_because_our_own_stdout_went_away_is_not_blamed() {
+    // `orchestrator run g | head -1`. Nothing the graph asked for went
+    // wrong: the node's work completed, and the only departed consumer was
+    // the orchestrator's own stdout. Reporting it as "failed (killed by
+    // signal 13)" blames a blameless node for ordinary `| head` usage.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("a", "seq 1 200000");
+
+    let out = run_graph_with_broken_stdout(dir.path(), &graph);
+
+    assert_eq!(
+        outcome_of(&out, "a"),
+        "stopped when the orchestrator's stdout went away (killed by signal 13)"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains(
+            "note: stdout was closed from our end once the orchestrator's stdout went away"
+        ),
+        "the summary must say why the node died:\n{err}"
+    );
+    assert_eq!(
+        code(&out),
+        0,
+        "every node's work completed and only our own terminal left:\n{err}"
+    );
+}
+
+#[test]
 fn another_nodes_failure_cancelling_a_sink_does_not_excuse_this_node() {
     // m fails, which skips c, which releases the sink c was being fed
     // through — and that sink was n's only destination. n then exits nonzero
