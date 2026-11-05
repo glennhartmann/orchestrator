@@ -348,7 +348,7 @@ config's `[options]` table:
   [emit] 1
   run summary:
     emit: stopped when the orchestrator's stdout went away (killed by signal 13)
-      note: stdout was closed from our end once the orchestrator's stdout went away
+      note: stdout was closed from our end once the orchestrator's stdout stopped accepting writes
   $ echo "${PIPESTATUS[0]}"
   0
   ```

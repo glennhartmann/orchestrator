@@ -14,11 +14,16 @@ pub enum Outcome {
     TruncatedInput {
         upstream: String,
     },
-    /// Exited 0, but one of its destinations failed mid-stream, so some of
-    /// the output it produced never arrived. Like [`Self::TruncatedInput`],
-    /// the node is not at fault and the run's results are still on the
-    /// floor. Only ever used for a node that exited 0: one that failed on
-    /// its own account keeps [`Self::Failed`].
+    /// One of its destinations failed mid-stream, so some of the output it
+    /// produced never arrived. Like [`Self::TruncatedInput`], the node is
+    /// not at fault and the run's results are still on the floor.
+    ///
+    /// Used for a node that exited 0, and for one the orchestrator SIGPIPEd
+    /// *because* the failing destination was the last sink of a pass-through
+    /// fan-out (`> /dev/full`) — there the lost bytes outrank the fact that
+    /// we were the proximate cause of the death, so this wins over
+    /// [`Self::PassthroughGone`]. A node that failed on its own account
+    /// keeps [`Self::Failed`].
     LostOutput {
         destination: String,
         error: String,
@@ -84,8 +89,14 @@ impl Outcome {
             Outcome::TruncatedInput { upstream } => {
                 format!("exited 0 with truncated input ({upstream} failed mid-stream)")
             }
+            // Deliberately says nothing about *how* the node ended. It
+            // covers both a node that exited 0 and one the orchestrator
+            // SIGPIPEd once the failing destination left the fan-out with
+            // no sinks, and "exited 0 but ..." would be a lie about the
+            // second. The node's blamelessness is in the wording's silence
+            // about it; the destination and its error are what to act on.
             Outcome::LostOutput { destination, error } => {
-                format!("exited 0 but its output to {destination} failed: {error}")
+                format!("its output to {destination} failed: {error}")
             }
             Outcome::PassthroughGone { destination } => {
                 format!("stopped when {destination} went away (killed by signal 13)")

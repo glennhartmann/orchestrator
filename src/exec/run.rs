@@ -612,7 +612,7 @@ impl<'p> Runner<'p> {
             self.note(
                 &name,
                 format!(
-                    "{} was closed from our end once {destination} went away",
+                    "{} was closed from our end once {destination} stopped accepting writes",
                     stream_label(*stream)
                 ),
             );
@@ -823,6 +823,21 @@ impl<'p> Runner<'p> {
             }
         } else if state.abandoned {
             Outcome::Abandoned
+        } else if let Some((destination, error)) = &state.lost_output {
+            // Checked *before* `passthrough_gone`, and this order is the
+            // whole rule. A sink that died of a write error empties the
+            // live set exactly as a cleanly departed consumer does, so the
+            // node takes our SIGPIPE either way and `passthrough_gone` is
+            // set in both cases. The difference is what happened to the
+            // bytes: output that was lost makes the run wrong (exit 1),
+            // where output nobody wanted any more does not (exit 0). Only
+            // `lost_output` can tell them apart — it is populated in
+            // `finish` from the sink's own outcome, which is why this lives
+            // here and not in the exit-time classification above.
+            Outcome::LostOutput {
+                destination: destination.clone(),
+                error: error.clone(),
+            }
         } else if let Some(destination) = &state.passthrough_gone {
             Outcome::PassthroughGone {
                 destination: destination.clone(),

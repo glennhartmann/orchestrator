@@ -67,6 +67,22 @@ pub fn run_graph_with_broken_stdout(dir: &Path, toml: &str) -> Output {
     wait_within(child, RUN_TIMEOUT)
 }
 
+/// Runs the graph with the orchestrator's own stdout pointed at `path`
+/// rather than at a pipe, as a shell's `> path` redirection does. For
+/// `/dev/full`, which accepts the open and then fails every write: the
+/// pass-through sink errors instead of closing cleanly.
+pub fn run_graph_with_stdout_to(dir: &Path, toml: &str, path: &str) -> Output {
+    let target = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("open {path} for the orchestrator's stdout: {e}"));
+    let child = command(dir, toml)
+        .stdout(Stdio::from(target))
+        .spawn()
+        .expect("spawn the orchestrator binary");
+    wait_within(child, RUN_TIMEOUT)
+}
+
 /// Waits for a run that is supposed to finish, turning a hang into a test
 /// failure instead of a hung suite.
 ///

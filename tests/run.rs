@@ -498,7 +498,8 @@ fn a_node_we_sigpiped_because_our_own_stdout_went_away_is_not_blamed() {
     let err = stderr(&out);
     assert!(
         err.contains(
-            "note: stdout was closed from our end once the orchestrator's stdout went away"
+            "note: stdout was closed from our end once the orchestrator's stdout stopped \
+             accepting writes"
         ),
         "the summary must say why the node died:\n{err}"
     );
@@ -506,6 +507,34 @@ fn a_node_we_sigpiped_because_our_own_stdout_went_away_is_not_blamed() {
         code(&out),
         0,
         "every node's work completed and only our own terminal left:\n{err}"
+    );
+}
+
+// `/dev/full` is Linux-only; see the note above
+// `a_destination_that_fails_mid_stream_fails_the_run`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_failure_on_our_own_stdout_is_still_a_failing_run() {
+    // `orchestrator run g > /dev/full`. The pass-through sink leaves the
+    // live set exactly as a departed `head` makes it, so the node takes our
+    // SIGPIPE either way — but here the output was *lost*, not merely no
+    // longer wanted, and a script reading only the exit code must not be
+    // told the run succeeded.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = sh("a", "seq 1 200000");
+
+    let out = run_graph_with_stdout_to(dir.path(), &graph, "/dev/full");
+
+    let outcome = outcome_of(&out, "a");
+    assert!(
+        outcome.contains("the orchestrator's stdout") && outcome.contains("No space left"),
+        "the failed destination must be named in the node's own outcome: {outcome}"
+    );
+    assert_eq!(
+        code(&out),
+        1,
+        "output thrown away makes the run wrong:\n{}",
+        stderr(&out)
     );
 }
 
@@ -556,7 +585,7 @@ fn a_destination_that_fails_mid_stream_fails_the_run() {
 
     let outcome = outcome_of(&out, "a");
     assert!(
-        outcome.starts_with("exited 0 but its output to /dev/full failed:"),
+        outcome.starts_with("its output to /dev/full failed:"),
         "the lost destination must be named in the node's own outcome: {outcome}"
     );
     let err = stderr(&out);
