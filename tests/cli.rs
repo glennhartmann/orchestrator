@@ -40,6 +40,48 @@ fn validate_prints_the_resolved_plan_and_exits_zero() {
 }
 
 #[test]
+fn validate_shows_file_and_parent_stdin_sources_and_order_dependencies() {
+    // Neither a file-sourced stdin, nor an inherited one, nor an order edge
+    // shows up among the fanouts, so printing only nodes and fanouts hid
+    // half of what `validate` had resolved.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.txt");
+    std::fs::write(&input, b"seed").expect("seed the input file");
+
+    let graph = argv("reader", &["cat"])
+        + &argv("gate", &["true"])
+        + "[[nodes]]\nname = \"asker\"\ncommand = [\"cat\"]\nstdinFromParent = true\n\n"
+        + &format!(
+            "[[edges]]\n[edges.data]\nnodeStdin = \"reader\"\nfile = \"{}\"\n\n",
+            input.display()
+        )
+        + &order_any_exit("gate", "reader");
+    let path = write_graph(dir.path(), "graph.toml", &graph);
+
+    let out = orchestrator()
+        .arg("validate")
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run validate");
+
+    assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
+    let printed = stderr(&out);
+    assert!(
+        printed.contains(&format!("stdin: file {}", input.display())),
+        "a file-sourced stdin must be visible:\n{printed}"
+    );
+    assert!(
+        printed.contains("stdin: the orchestrator's own stdin"),
+        "an inherited stdin must be visible:\n{printed}"
+    );
+    assert!(
+        printed.contains("waits for: gate (any exit)"),
+        "an order dependency must be visible, with its any-exit relaxation:\n{printed}"
+    );
+}
+
+#[test]
 fn validate_reports_every_error_at_once_and_exits_two() {
     let dir = tempfile::tempdir().unwrap();
     // "ghost" is unknown, and a -> b -> a is a cycle.

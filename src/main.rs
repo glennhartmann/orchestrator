@@ -16,7 +16,7 @@ use clap::Parser;
 use cli::{Cli, Command, GraphArgs};
 use orchestrator::config::{self, ConfigError};
 use orchestrator::exec::run::run;
-use orchestrator::graph::{Plan, ValidationError};
+use orchestrator::graph::{Plan, StdinSource, ValidationError};
 use orchestrator::pb;
 
 /// Config and validation problems exit 2, so a script can tell "I wrote a
@@ -127,6 +127,21 @@ fn describe_sink(plan: &Plan, sink: &orchestrator::graph::SinkSpec) -> String {
     }
 }
 
+/// One node's resolved stdin, in prose — or `None` for the default, an
+/// immediately closed stdin, which is not worth a line of its own.
+fn describe_stdin(plan: &Plan, stdin: &StdinSource) -> Option<String> {
+    match stdin {
+        StdinSource::Empty => None,
+        StdinSource::Parent => Some("the orchestrator's own stdin".to_string()),
+        StdinSource::Node { from, stream } => Some(format!(
+            "{}'s {}",
+            node_name(plan, *from),
+            stream_name(*stream)
+        )),
+        StdinSource::File(path) => Some(format!("file {}", path.display())),
+    }
+}
+
 /// Prints the resolved plan: every node, its fanouts, and the effective
 /// options, so `validate` is useful for more than a bare pass/fail. Node
 /// identity is always shown by name — an operator reading this should
@@ -143,6 +158,28 @@ fn print_plan(plan: &Plan, w: &mut impl std::io::Write) {
     let _ = writeln!(w, "  nodes:");
     for node in &plan.nodes {
         let _ = writeln!(w, "    {} {:?}", node.name, node.command);
+        // A file-sourced or inherited stdin appears nowhere else in this
+        // listing — the fanouts below only cover node-to-node data — and
+        // neither do order dependencies. Without these two lines half the
+        // resolution `validate` performed is invisible.
+        if let Some(stdin) = describe_stdin(plan, &node.stdin) {
+            let _ = writeln!(w, "      stdin: {stdin}");
+        }
+        if !node.order_deps.is_empty() {
+            let deps: Vec<String> = node
+                .order_deps
+                .iter()
+                .map(|d| {
+                    let name = node_name(plan, d.after);
+                    if d.any_exit {
+                        format!("{name} (any exit)")
+                    } else {
+                        name.to_string()
+                    }
+                })
+                .collect();
+            let _ = writeln!(w, "      waits for: {}", deps.join(", "));
+        }
     }
     let _ = writeln!(w, "  fanouts:");
     for fanout in &plan.fanouts {
