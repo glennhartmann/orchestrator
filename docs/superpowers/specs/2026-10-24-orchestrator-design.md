@@ -225,6 +225,10 @@ to override.
 Validation happens before anything is spawned, and rejects:
 
 - cycles in the combined data+order dependency graph
+- a data edge `X -> Y` where `Y` has an order-dependency path back to `X`.
+  Not a cycle — both kinds of edge run `X -> Y` — but exactly the deadlock
+  condition: `Y` cannot start until `X` exits, while `X` throttles on `Y`'s
+  unread queue. (Added during implementation; the original list missed it.)
 - more than one inbound data edge on a node
 - duplicate node names
 - edges referring to unknown nodes
