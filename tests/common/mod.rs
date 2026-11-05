@@ -1,6 +1,12 @@
 //! Shared harness for the end-to-end run tests: write a graph into a
 //! temporary directory and invoke the real `orchestrator` binary on it.
 
+// This module is included by several test binaries, each of which uses a
+// different subset of it. Without this, every helper another target needs
+// is a `dead_code` warning here — noise in the test output and a
+// `clippy --all-targets -D warnings` failure.
+#![allow(dead_code)]
+
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 

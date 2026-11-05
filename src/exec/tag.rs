@@ -9,6 +9,11 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+/// A `Write` handle shared between every [`TaggedWriter`] that targets the
+/// same stream — in practice the orchestrator's one real stdout or stderr,
+/// written to by one tagged writer per node.
+pub type SharedSink = Arc<Mutex<Box<dyn Write + Send>>>;
+
 /// Writes chunks of bytes to a shared sink, tagging each complete line
 /// with `[tag] ` and buffering any trailing partial line until it is
 /// completed or explicitly flushed with [`TaggedWriter::flush_partial`].
@@ -22,12 +27,12 @@ use std::sync::{Arc, Mutex};
 /// buffering and no line splitting — this is the `--no-tags` path.
 pub struct TaggedWriter {
     tag: Option<String>,
-    out: Arc<Mutex<Box<dyn Write + Send>>>,
+    out: SharedSink,
     partial: Vec<u8>,
 }
 
 impl TaggedWriter {
-    pub fn new(tag: Option<String>, out: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
+    pub fn new(tag: Option<String>, out: SharedSink) -> Self {
         Self {
             tag,
             out,
@@ -116,10 +121,9 @@ mod tests {
         }
     }
 
-    fn shared_sink() -> (Arc<Mutex<Box<dyn Write + Send>>>, Arc<Mutex<Vec<u8>>>) {
+    fn shared_sink() -> (SharedSink, Arc<Mutex<Vec<u8>>>) {
         let buf = Arc::new(Mutex::new(Vec::new()));
-        let sink: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(Box::new(SharedBuf(buf.clone()))));
+        let sink: SharedSink = Arc::new(Mutex::new(Box::new(SharedBuf(buf.clone()))));
         (sink, buf)
     }
 

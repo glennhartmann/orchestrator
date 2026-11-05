@@ -7,15 +7,19 @@
 //! Task 6's tee.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
+// Used only by the in-module `TestSink` and the tests below.
+#[cfg(test)]
+use std::io::Write;
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::oneshot;
 
-use crate::exec::tag::TaggedWriter;
+use crate::exec::tag::{SharedSink, TaggedWriter};
 use crate::graph::{NodeId, SinkSpec};
 use crate::pb;
 
@@ -272,8 +276,8 @@ impl Sink {
 /// orchestrator's own stdout/stderr.
 pub struct SinkCtx {
     pub child_stdins: HashMap<NodeId, oneshot::Receiver<ChildStdin>>,
-    pub stdout: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub stderr: Arc<Mutex<Box<dyn Write + Send>>>,
+    pub stdout: SharedSink,
+    pub stderr: SharedSink,
     /// Whether passthrough output should be tagged with its source node's
     /// name. Set once from `Plan.tags` when the context is constructed for
     /// a run and never updated afterwards — unlike a per-call mutable
@@ -367,10 +371,9 @@ mod tests {
         }
     }
 
-    fn shared_writer() -> (Arc<Mutex<Box<dyn Write + Send>>>, Arc<Mutex<Vec<u8>>>) {
+    fn shared_writer() -> (SharedSink, Arc<Mutex<Vec<u8>>>) {
         let buf = Arc::new(Mutex::new(Vec::new()));
-        let out: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(Box::new(SharedBuf(buf.clone()))));
+        let out: SharedSink = Arc::new(Mutex::new(Box::new(SharedBuf(buf.clone()))));
         (out, buf)
     }
 
