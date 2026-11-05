@@ -69,6 +69,22 @@ fn data_file_to_file(src_path: &str, sink_path: &str, append: bool) -> pb::Edge 
     }
 }
 
+/// A data edge with whichever halves the caller supplies — including
+/// neither, which is what an `[[edges]]` entry with an empty `[edges.data]`
+/// table deserializes to.
+fn data_edge(source: Option<pb::data_edge::Source>, sink: Option<pb::data_edge::Sink>) -> pb::Edge {
+    pb::Edge {
+        kind: Some(pb::edge::Kind::Data(pb::DataEdge { source, sink })),
+    }
+}
+
+fn node_source(name: &str) -> pb::data_edge::Source {
+    pb::data_edge::Source::Node(pb::NodeStream {
+        node: name.to_string(),
+        stream: pb::Stream::Stdout as i32,
+    })
+}
+
 fn order(after: &str, downstream: &str, any_exit: bool) -> pb::Edge {
     pb::Edge {
         kind: Some(pb::edge::Kind::Order(pb::OrderEdge {
@@ -363,6 +379,183 @@ fn rejects_file_to_file_edge() {
 }
 
 #[test]
+fn rejects_a_data_edge_with_no_source() {
+    // Measured before this rule existed: the edge was silently dropped, `b`
+    // ran on an empty stdin, and the run reported success.
+    let g = graph(
+        vec![node("a", &["true"]), node("b", &["cat"])],
+        vec![data_edge(
+            None,
+            Some(pb::data_edge::Sink::NodeStdin("b".to_string())),
+        )],
+    );
+    let errs = Plan::from_proto(g).expect_err("a sourceless data edge must be rejected");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::IncompleteDataEdge { index: 0, missing } if missing == "source"
+        )),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn rejects_a_data_edge_with_no_sink() {
+    let g = graph(
+        vec![node("a", &["true"])],
+        vec![data_edge(Some(node_source("a")), None)],
+    );
+    let errs = Plan::from_proto(g).expect_err("a sinkless data edge must be rejected");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::IncompleteDataEdge { index: 0, missing } if missing == "sink"
+        )),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn rejects_a_data_edge_with_neither_half() {
+    let g = graph(vec![node("a", &["true"])], vec![data_edge(None, None)]);
+    let errs = Plan::from_proto(g).expect_err("an empty data edge must be rejected");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::IncompleteDataEdge { index: 0, .. })),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn rejects_an_edge_with_no_kind() {
+    let g = graph(vec![node("a", &["true"])], vec![pb::Edge { kind: None }]);
+    let errs = Plan::from_proto(g).expect_err("an edge that is neither data nor order is a typo");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::EdgeWithoutKind(0))),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn rejects_an_order_edge_from_a_node_to_its_own_data_consumer() {
+    // `b` reads `a`'s stdout and also waits for `a` to exit. Not a cycle in
+    // the dependency union — both edges run a -> b — but a guaranteed
+    // deadlock once a's output fills b's queue: a cannot exit until b
+    // drains, and b cannot start until a exits.
+    let g = graph(
+        vec![node("a", &["true"]), node("b", &["cat"])],
+        vec![
+            data_node_to_stdin("a", pb::Stream::Stdout, "b"),
+            order("a", "b", false),
+        ],
+    );
+    let errs = Plan::from_proto(g).expect_err("the deadlock shape must be rejected");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::OrderDependencyOnDataProducer { producer, consumer }
+                if producer == "a" && consumer == "b"
+        )),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn rejects_a_transitive_order_path_back_to_a_data_producer() {
+    // a -> c as data; c waits for b, and b waits for a. The order path
+    // c <- b <- a means c still cannot start until a has exited, so it
+    // deadlocks on exactly the same grounds as the direct case.
+    let g = graph(
+        vec![
+            node("a", &["true"]),
+            node("b", &["true"]),
+            node("c", &["cat"]),
+        ],
+        vec![
+            data_node_to_stdin("a", pb::Stream::Stdout, "c"),
+            order("a", "b", false),
+            order("b", "c", false),
+        ],
+    );
+    let errs = Plan::from_proto(g).expect_err("a transitive order path must be rejected too");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::OrderDependencyOnDataProducer { producer, consumer }
+                if producer == "a" && consumer == "c"
+        )),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn accepts_an_order_edge_from_a_sibling_consumer() {
+    // The spec's own example, which the deadlock rule must not touch: `a`
+    // fans out to `b` and `c`, and `c` additionally waits for `b`. `b`
+    // starts as soon as `a` starts, so `b` can exit while `a` is still
+    // producing, and `c` then runs. No order path leads from `a` to `c`.
+    let g = graph(
+        vec![
+            node("a", &["true"]),
+            node("b", &["cat"]),
+            node("c", &["cat"]),
+        ],
+        vec![
+            data_node_to_stdin("a", pb::Stream::Stdout, "b"),
+            data_node_to_stdin("a", pb::Stream::Stdout, "c"),
+            order("b", "c", false),
+        ],
+    );
+    Plan::from_proto(g).expect("an order edge between siblings of a fan-out is legal");
+}
+
+#[test]
+fn rejects_a_zero_queue_cap() {
+    // Clamped to a 1-byte read loop internally, which turned 1.3 MB into
+    // 34 seconds. It is a config mistake, so it is rejected up front.
+    let mut g = graph(vec![node("a", &["true"])], vec![]);
+    g.options = Some(pb::Options {
+        queue_cap_bytes: Some(0),
+        ..Default::default()
+    });
+    let errs = Plan::from_proto(g).expect_err("a zero queue cap must be rejected");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ZeroQueueCap)),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn rejects_a_file_source_that_exists_but_cannot_be_read() {
+    // `fs::metadata` succeeds on a mode-000 file, so a stat-only check let
+    // this through validation and failed at spawn time instead.
+    let dir = tempdir("unreadable-source");
+    let path = dir.join("secret.txt");
+    std::fs::write(&path, b"data").expect("seed source file");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+    std::fs::set_permissions(&path, perms).expect("make file unreadable");
+
+    let g = graph(
+        vec![node("a", &["cat"])],
+        vec![data_file_to_stdin(path.to_str().unwrap(), "a")],
+    );
+    let errs = Plan::from_proto(g).expect_err("an unreadable file source must be rejected");
+
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+    std::fs::set_permissions(&path, perms).ok();
+
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::UnreadableFileSource(p) if *p == path)),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
 fn validation_creates_no_files() {
     let dir = tempdir("no-side-effects");
     let sink_path = dir.join("out.txt");
@@ -523,10 +716,14 @@ fn diamond_resolves() {
 #[test]
 fn to_dot_renders_nodes_and_edges() {
     let g = graph(
-        vec![node("a", &["true"]), node("b", &["cat"])],
+        vec![
+            node("a", &["true"]),
+            node("b", &["cat"]),
+            node("c", &["true"]),
+        ],
         vec![
             data_node_to_stdin("a", pb::Stream::Stdout, "b"),
-            order("a", "b", false),
+            order("b", "c", false),
         ],
     );
     let plan = Plan::from_proto(g).expect("valid graph");

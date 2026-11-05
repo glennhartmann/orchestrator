@@ -204,6 +204,39 @@ async fn stdin_source_parent_inherits_the_fd() {
 }
 
 #[tokio::test]
+async fn stdin_source_file_feeds_the_files_bytes() {
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    tmp.write_all(b"from-a-file\n").unwrap();
+    tmp.flush().unwrap();
+
+    let spec = base_spec(vec!["cat"]);
+    let stdin = stdio_for(&StdinSource::File(tmp.path().to_path_buf()))
+        .expect("an existing, readable file opens");
+    let mut spawned = spawn(&spec, stdin, true, false, false).unwrap();
+
+    let out = read_all_stdout(&mut spawned.child).await;
+    let status = spawned.child.wait().await.unwrap();
+
+    assert!(status.success());
+    assert_eq!(out, "from-a-file\n");
+}
+
+#[tokio::test]
+async fn stdin_source_file_error_names_the_path() {
+    // A path that validation would reject, reached anyway (it can be
+    // removed between `validate` and `run`). The error has to say *which*
+    // file: a bare "Permission denied (os error 13)" is unactionable.
+    let path = std::path::PathBuf::from("/definitely/does/not/exist/orchestrator-stdin.txt");
+    let err = stdio_for(&StdinSource::File(path.clone())).expect_err("the path does not exist");
+
+    assert!(
+        err.to_string().contains(path.to_str().unwrap()),
+        "the error must name the path it could not open: {err}"
+    );
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[tokio::test]
 async fn stdin_source_empty_gives_immediate_eof() {
     let spec = base_spec(vec!["cat"]);
     let stdin = stdio_for(&StdinSource::Empty).unwrap();

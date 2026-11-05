@@ -30,7 +30,16 @@ pub fn stdio_for(src: &StdinSource) -> io::Result<Stdio> {
         StdinSource::Empty => Stdio::null(),
         StdinSource::Parent => Stdio::inherit(),
         StdinSource::Node { .. } => Stdio::piped(),
-        StdinSource::File(path) => Stdio::from(std::fs::File::open(path)?),
+        // Validation already opened this path for reading, but the file can
+        // be removed or chmod'ed between `validate` and `run`, so the error
+        // has to be actionable on its own: a bare "Permission denied (os
+        // error 13)" does not say which file.
+        StdinSource::File(path) => Stdio::from(std::fs::File::open(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot read {} as stdin: {e}", path.display()),
+            )
+        })?),
     })
 }
 

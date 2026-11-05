@@ -2,8 +2,9 @@
 //! resolution, every structural validation rule, and the DOT rendering
 //! used by the CLI's `--dot` flag.
 //!
-//! Validation never touches the filesystem beyond `stat`-ing a path: no
-//! output file is ever created, opened for write, or truncated here.
+//! Validation never touches the filesystem beyond `stat`-ing a path and
+//! opening an input file for *reading*: no output file is ever created,
+//! opened for write, or truncated here.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -122,6 +123,26 @@ pub enum ValidationError {
         source_path: PathBuf,
         sink_path: PathBuf,
     },
+    /// A data edge with only one of its two halves. Silently dropping it
+    /// would run the sink node on an empty stdin and report success.
+    /// `missing` is `"source"`, `"sink"`, or `"source and no sink"`.
+    #[error(
+        "edges[{index}]: a data edge needs both a source and a sink; this one has no {missing}"
+    )]
+    IncompleteDataEdge { index: usize, missing: String },
+    #[error(
+        "edges[{0}]: an edge must specify either `data` or `order`; this one specifies neither"
+    )]
+    EdgeWithoutKind(usize),
+    #[error(
+        "node {consumer} reads {producer}'s output and also waits for {producer} to exit: \
+         {producer} cannot exit until {consumer} has drained its output, and {consumer} \
+         cannot start until {producer} has exited, so the run deadlocks as soon as the \
+         queue fills"
+    )]
+    OrderDependencyOnDataProducer { producer: String, consumer: String },
+    #[error("queue_cap_bytes must be at least 1 byte")]
+    ZeroQueueCap,
 }
 
 // --- resolution helpers, not part of the public API ------------------------
@@ -197,6 +218,26 @@ fn find_cycle(adj: &[Vec<NodeId>], names: &[String]) -> Option<Vec<String>> {
         }
     }
     None
+}
+
+/// True if `to` is reachable from `from` in `adj`. Iterative, and safe on a
+/// cyclic graph (a cycle is reported separately by [`find_cycle`]).
+fn reaches(adj: &[Vec<NodeId>], from: NodeId, to: NodeId) -> bool {
+    let mut seen = vec![false; adj.len()];
+    seen[from.0] = true;
+    let mut stack = vec![from];
+    while let Some(u) = stack.pop() {
+        for &v in &adj[u.0] {
+            if v == to {
+                return true;
+            }
+            if !seen[v.0] {
+                seen[v.0] = true;
+                stack.push(v);
+            }
+        }
+    }
+    false
 }
 
 /// True if `dir` exists, is a directory, and appears writable.
@@ -281,8 +322,13 @@ impl Plan {
         let mut node_fanout_edges: Vec<(NodeId, pb::Stream, SinkSpec)> = Vec::new();
         let mut file_sink_paths: Vec<PathBuf> = Vec::new();
         let mut file_source_paths: HashSet<PathBuf> = HashSet::new();
+        // Order edges alone, for the deadlock rule in step 9b. `dep_edges`
+        // merges both kinds and so cannot answer "does this consumer wait
+        // for its own producer to *exit*?".
+        let mut order_adj: Vec<Vec<NodeId>> = vec![Vec::new(); node_specs.len()];
+        let mut data_node_edges: Vec<(NodeId, NodeId)> = Vec::new();
 
-        for edge in &g.edges {
+        for (index, edge) in g.edges.iter().enumerate() {
             match &edge.kind {
                 Some(pb::edge::Kind::Order(oe)) => {
                     let after = resolve_node(&oe.after, &name_to_id);
@@ -295,6 +341,7 @@ impl Plan {
                     }
                     if let (Some(a), Some(n)) = (after, node) {
                         dep_edges.push((a, n));
+                        order_adj[a.0].push(n);
                         node_specs[n.0].order_deps.push(OrderDep {
                             after: a,
                             any_exit: oe.any_exit,
@@ -302,6 +349,24 @@ impl Plan {
                     }
                 }
                 Some(pb::edge::Kind::Data(de)) => {
+                    // A half-specified edge is a typo, not a request. Left
+                    // to fall through the resolution below it would simply
+                    // be dropped, and a node whose only inbound edge was
+                    // dropped runs on an empty stdin and reports success.
+                    let missing = match (&de.source, &de.sink) {
+                        (None, None) => Some("source and no sink"),
+                        (None, Some(_)) => Some("source"),
+                        (Some(_), None) => Some("sink"),
+                        (Some(_), Some(_)) => None,
+                    };
+                    if let Some(missing) = missing {
+                        errors.push(ValidationError::IncompleteDataEdge {
+                            index,
+                            missing: missing.to_string(),
+                        });
+                        continue;
+                    }
+
                     // Ruling E: a file-to-file edge is a `cp`, not a graph edge.
                     if let (
                         Some(pb::data_edge::Source::File(src_path)),
@@ -373,6 +438,7 @@ impl Plan {
                             Some(ResolvedSink::NodeStdin(sink_id)),
                         ) => {
                             dep_edges.push((src_id, sink_id));
+                            data_node_edges.push((src_id, sink_id));
                             stdin_edges.push(StdinEdge {
                                 target: sink_id,
                                 source: StdinSource::Node {
@@ -404,7 +470,7 @@ impl Plan {
                         _ => {} // one or both sides already recorded their own error
                     }
                 }
-                None => {}
+                None => errors.push(ValidationError::EdgeWithoutKind(index)),
             }
         }
 
@@ -493,9 +559,33 @@ impl Plan {
             errors.push(ValidationError::Cycle(cycle));
         }
 
-        // 10. File checks — stat only, never open for write.
+        // 9b. A data edge X -> Y whose consumer Y also waits, directly or
+        // transitively, for X to *exit* is a deadlock, not a cycle: both
+        // kinds of edge run X -> Y, so the union above is acyclic. X cannot
+        // exit until Y drains the output it is throttled on, and Y cannot
+        // start until X has exited. Below the queue cap it happens to work,
+        // which is worse than failing: it green-lights a production hang.
+        //
+        // Only order edges are followed. A path that uses a data edge is
+        // not a deadlock — a data consumer starts as soon as its producer
+        // *starts*, so it can exit while the producer is still writing —
+        // which is what makes the spec's "E waits on B and D, and takes
+        // data from C" fan-out legal.
+        for &(producer, consumer) in &data_node_edges {
+            if reaches(&order_adj, producer, consumer) {
+                errors.push(ValidationError::OrderDependencyOnDataProducer {
+                    producer: names[producer.0].clone(),
+                    consumer: names[consumer.0].clone(),
+                });
+            }
+        }
+
+        // 10. File checks. Output paths are never opened — only their parent
+        // directory is stat'ed. An *input* path is opened for reading, which
+        // has no side effects and is the only way to tell a readable file
+        // from one that merely exists (`stat` succeeds on mode 000).
         for path in &file_source_paths {
-            if std::fs::metadata(path).is_err() {
+            if std::fs::File::open(path).is_err() {
                 errors.push(ValidationError::UnreadableFileSource(path.clone()));
             }
         }
@@ -523,6 +613,13 @@ impl Plan {
             .and_then(|o| o.queue_cap_bytes)
             .map(|v| v as usize)
             .unwrap_or(DEFAULT_QUEUE_CAP_BYTES);
+        // The tee clamps a zero cap up to one byte so a chunk is always
+        // admissible, which turns the whole run into a one-byte-at-a-time
+        // read loop. That is never what anyone meant, so it is a config
+        // error rather than a silent 300x slowdown.
+        if queue_cap_bytes == 0 {
+            errors.push(ValidationError::ZeroQueueCap);
+        }
         let tags = !g.options.as_ref().map(|o| o.no_tags).unwrap_or(false);
         let shutdown_grace = g
             .options
