@@ -21,6 +21,22 @@ fn base_spec(command: Vec<&str>) -> NodeSpec {
     }
 }
 
+/// Resolves `program` against the test process's own `PATH`.
+///
+/// A node spawned with `clear_env` has no `PATH` of its own, and program
+/// lookup uses the *child's* environment — so an unqualified name falls back
+/// to the system default path (`/bin:/usr/bin`), which need not contain the
+/// binary at all (it doesn't inside a Nix build sandbox, where coreutils
+/// lives in a store path). Tests that clear the env must name the program
+/// absolutely.
+fn resolve_in_path(program: &str) -> std::path::PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH should be set for the test process");
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{program} not found on PATH"))
+}
+
 async fn read_all_stdout(child: &mut tokio::process::Child) -> String {
     let mut buf = String::new();
     child
@@ -90,7 +106,8 @@ async fn clear_env_starts_empty() {
         std::env::set_var("ORCH_TEST_SHOULD_NOT_APPEAR", "nope");
     }
 
-    let mut spec = base_spec(vec!["env"]);
+    let env_bin = resolve_in_path("env");
+    let mut spec = base_spec(vec![env_bin.to_str().expect("env path should be UTF-8")]);
     spec.clear_env = true;
     spec.env
         .insert("ONLY_VAR".to_string(), "only-value".to_string());
