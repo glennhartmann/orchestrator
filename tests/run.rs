@@ -189,7 +189,11 @@ fn a_producer_whose_consumer_was_already_skipped_still_finishes() {
     let dir = tempfile::tempdir().unwrap();
     let graph = argv("bad", &["false"])
         + &sh("gate", "sleep 1")
-        + &sh("p", "seq 1 100000")
+        // Run without a shell: `sh -c` would be the process we SIGPIPE, and
+        // only some shells exec a lone command. One that forks instead
+        // survives to report its child's death as exit 141, which is not the
+        // signal death this test is about.
+        + &argv("p", &["seq", "1", "100000"])
         + &sh("c", "cat > {dir}/c.out")
         + &order("gate", "p")
         + &data("p", "c")
@@ -487,7 +491,9 @@ fn a_node_we_sigpiped_because_our_own_stdout_went_away_is_not_blamed() {
     // the orchestrator's own stdout. Reporting it as "failed (killed by
     // signal 13)" blames a blameless node for ordinary `| head` usage.
     let dir = tempfile::tempdir().unwrap();
-    let graph = sh("a", "seq 1 200000");
+    // No shell: see the note in
+    // `a_producer_whose_consumer_was_already_skipped_still_finishes`.
+    let graph = argv("a", &["seq", "1", "200000"]);
 
     let out = run_graph_with_broken_stdout(dir.path(), &graph);
 
@@ -648,7 +654,9 @@ fn a_consumer_that_fails_to_start_releases_the_producer_it_was_throttling() {
     // arrive, holding the permits the fan-out needs, and the producer —
     // throttled by a 1 KiB queue — never exits and the run never ends.
     let dir = tempfile::tempdir().unwrap();
-    let graph = sh("p", "seq 1 200000")
+    // No shell: see the note in
+    // `a_producer_whose_consumer_was_already_skipped_still_finishes`.
+    let graph = argv("p", &["seq", "1", "200000"])
         + &argv("c", &["orchestrator-no-such-program-xyzzy"])
         + &data("p", "c")
         + &queue_cap_bytes(1024);
